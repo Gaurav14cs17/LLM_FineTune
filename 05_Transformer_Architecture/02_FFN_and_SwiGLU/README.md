@@ -1,172 +1,328 @@
-# 02 — Feed-Forward Network and SwiGLU
+# Feed-Forward Network with SwiGLU
 
-## 1. Standard FFN — Role and Formulation
+The Transformer mixes information across positions with attention; the **position-wise feed-forward network (FFN)** is where most parameters live and where per-token nonlinear **capacity** is concentrated. This note compares the classical GELU/ReLU MLP to **SwiGLU** (Swish-activated Gated Linear Unit), links the **8/3×** width rule to parameter and FLOP budgets, and contrasts activations used in modern LLMs.
 
-```
-The FFN processes each token position INDEPENDENTLY (no cross-token interaction):
-  FFN(X) applies the same function to each row of X ∈ ℝ^{n×d}
+---
 
-For a single token x ∈ ℝ^d:
-  STANDARD (GELU/ReLU):
-    FFN(x) = σ(x·W₁ + b₁) · W₂ + b₂
-    W₁ ∈ ℝ^{d×d_ff},   b₁ ∈ ℝ^{d_ff}
-    W₂ ∈ ℝ^{d_ff×d},   b₂ ∈ ℝ^d
+## Table of Contents
 
-WHY 4× EXPANSION (d_ff = 4d)?
-  UNIVERSAL APPROXIMATION: a 2-layer network with n hidden units can approximate
-  any continuous function on a compact domain.
-  
-  The FFN can be viewed as a KEY-VALUE MEMORY (Geva et al. 2021):
-    Each hidden neuron i corresponds to a (pattern, value) pair:
-      pattern_i = W₁[:,i]   (first column of W₁ = a pattern that activates neuron i)
-      value_i   = W₂[i,:]   (corresponding row of W₂ = what to output when activated)
-    
-    FFN(x) = ∑_i σ(x·pattern_i) × value_i
-           = weighted sum of stored values (soft lookup table!)
-  
-  Larger d_ff → more stored patterns → more factual knowledge capacity.
-  Research shows FFN neurons store factual knowledge (e.g., "Paris is the capital of France").
-```
+- [INTUITION](#intuition)
+- [VARIABLES & SHAPES](#variables--shapes)
+- [Standard Two-Matrix FFN](#standard-two-matrix-ffn)
+- [SwiGLU: Definition and Geometry](#swiglu-definition-and-geometry)
+- [SiLU / Swish: Smooth Gating](#silu--swish-smooth-gating)
+- [Parameter Budget: The \(8d/3\) Rule](#parameter-budget-the-8d3-rule)
+- [FLOPs Accounting (Per Token)](#flops-accounting-per-token)
+- [LLaMA-3 8B: \(d_{\text{ff}} = 14336\)](#llama-3-8b-d_textff--14336)
+- [ReLU vs GELU vs SwiGLU (Qualitative)](#relu-vs-gelu-vs-swiglu-qualitative)
+- [Key–Value Memory View](#keyvalue-memory-view)
+- [NUMERICAL EXAMPLES](#numerical-examples)
+- [Pseudocode](#pseudocode)
+- [Backward Pass Sketch](#backward-pass-sketch)
+- [COMMON MISTAKES](#common-mistakes)
+- [EXERCISES](#exercises)
+- [REFERENCES](#references)
 
-## 2. SwiGLU — Derivation and Properties
+---
+
+## INTUITION
 
 ```
-SwiGLU (Shazeer 2020) = Swish activation + Gated Linear Unit
+    TOKEN x (d-dim)  ─────┬──────────────────────────────────────────────►
+                          │
+              ┌───────────┴───────────┐
+              │   ATTENTION (mixes)    │   FFN (same fn each row: "recall + refit")
+              └───────────┬───────────┘
+                          │
+     Standard FFN:         │         SwiGLU FFN:
+     h = σ(W₁x)            │         a = W_up x
+     y = W₂h               │         b = W_gate x
+                          │         h = SiLU(b) ⊙ a    ←── gate picks sub-experts
+                          │         y = W_down h
+                          ▼
+              High-rank "pattern → value" map; most MODEL params sit here
 
-SWISH ACTIVATION:
-  Swish(x) = x · σ(x)  where σ(x) = 1/(1+e^{-x})
-
-  PROPERTIES:
-    Swish(0) = 0 × 0.5 = 0
-    Swish(x) → x as x → ∞   (linear for large positive x)
-    Swish(x) → 0 as x → −∞  (gates off large negative inputs)
-    
-    Derivative:
-    d/dx [x·σ(x)] = σ(x) + x·σ(x)(1−σ(x)) = σ(x)(1 + x − x·σ(x))
-    → Smooth, non-monotone near x=−1.28 (small negative dip, helps with gradient flow)
-
-GATED LINEAR UNIT (GLU):
-  GLU(x) = (x·W₁) ⊙ σ(x·W₂)
-  ↑ linear transformation  ↑ sigmoid gate
-
-SWIGLU combines them:
-  ┌──────────────────────────────────────────────────────────────┐
-  │  SwiGLU(x) = (x · W₁ ⊙ Swish(x · W_gate)) · W₂            │
-  │                                                              │
-  │  = (x·W₁ ⊙ (x·W_gate · σ(x·W_gate))) · W₂                 │
-  └──────────────────────────────────────────────────────────────┘
-
-  W₁, W_gate ∈ ℝ^{d×d_ff}   (two "up" projections)
-  W₂ ∈ ℝ^{d_ff×d}           (one "down" projection)
-  THREE matrices total  (vs TWO for standard FFN)
+        ┌───────────────────────────────────────────────────────────────┐
+        │  SiLU(b) ⊙ a  =  smooth, data-dependent routing of channels   │
+        │                 (unlike ReLU's hard half-space cut)            │
+        └───────────────────────────────────────────────────────────────┘
 ```
 
-## 3. Parameter Budget — Why d_ff = 2/3 × 4d for SwiGLU
+**Roadmap:** a classical FFN is two matmuls with one nonlinearity. SwiGLU **duplicates** the up-projection to obtain a **gate** and a **value** path, then multiplies them—adding **adaptive per-channel curvature** at the cost of a third weight matrix. Shrink hidden width by **\(8/(3\times 4)=\)** **\(2/3\)** relative to a “\(4d\)” MLP (i.e. \(d_{\text{ff}} \approx 8d/3\)) to **preserve** parameter and FLOP parity; production models (e.g. LLaMA-3) often go **wider** (e.g. **\(3.5d\)**) deliberately trading compute for quality.
+
+---
+
+## VARIABLES & SHAPES
+
+| Symbol | Shape / role |
+|--------|----------------|
+| \(d\) | Model **hidden size** (residual stream width); e.g. 4096 in LLaMA-3 8B configs cited in public cards |
+| \(d_{\text{ff}}\) | FFN inner (“bottleneck expansion”) dimension |
+| \(x\) | Single-token input in \(\mathbb{R}^d\) (row of \(X\in\mathbb{R}^{T\times d}\)) |
+| \(W_1, W_2\) | Standard FFN: \(W_1\in\mathbb{R}^{d\times d_{\text{ff}}}\), \(W_2\in\mathbb{R}^{d_{\text{ff}}\times d}\) |
+| \(W_{\text{up}}, W_{\text{gate}}, W_{\text{down}}\) | SwiGLU: \(W_{\text{up}}, W_{\text{gate}}\in\mathbb{R}^{d\times d_{\text{ff}}}\), \(W_{\text{down}}\in\mathbb{R}^{d_{\text{ff}}\times d}\) |
+| \(\sigma\) | Logistic sigmoid \(\sigma(z) = 1/(1+e^{-z})\) |
+| \(\mathrm{SiLU}(z)\) | \(z\cdot \sigma(z)\) (a.k.a. Swish with \(\beta=1\)) |
+| \(\odot\) | Elementwise (Hadamard) product of two length-\(d_{\text{ff}}\) vectors |
+
+Bias vectors are often omitted in large LMs (especially with RMSNorm); including them adds \(O(d_{\text{ff}})\) parameters, negligible next to weights.
+
+---
+
+## Standard Two-Matrix FFN
+
+For one token (column-oriented convention \(x \in \mathbb{R}^{1\times d}\)):
+
+\[
+h \;=\; \varphi(x W_1), \qquad y \;=\; h W_2
+\]
+
+Common choices: \(\varphi=\) **ReLU**, **GELU**, **GeLU-approx**. Shapes: \(h \in \mathbb{R}^{1\times d_{\text{ff}}}\).
+
+**Parameter count (no bias):**
+
+\[
+|\theta|_{\text{std}} \;=\; d d_{\text{ff}} + d_{\text{ff}} d \;=\; 2 d d_{\text{ff}}.
+\]
+
+The classic “\(4d\)” MLP sets \(d_{\text{ff}} = 4d\), giving **\(8d^2\)** parameters in the block—until SwiGLU, this was the usual baseline for scaling discussions.
+
+**Universality intuition:** width \(d_{\text{ff}}\) trades off **expressivity** (approximating functions of a single token’s vector) versus memory/compute. Research on “key-value” views of FFNs interprets columns of \(W_1\) / rows of \(W_2\) as soft memory entries; SwiGLU adds a **per-entry gate** on how strongly each “value” contributes.
+
+---
+
+## SwiGLU: Definition and Geometry
+
+**Exact modern form (matches Shazeer; used in PaLM/LLaMA line):**
+
+\[
+a \;=\; x W_{\text{up}}, \qquad b \;=\; x W_{\text{gate}}
+\]
+\[
+h \;=\; \mathrm{SiLU}(b) \odot a \;=\; (b \odot \sigma(b)) \odot a
+\]
+\[
+y \;=\; h W_{\text{down}}
+\]
+
+Some texts swap labels \(W_1/W_3\); always identify **two up-projections** and **one down**. Gating **multiplies** the value path by a **smooth, input-dependent** vector in \((0,\infty)\) (asymptotically like **scale** per channel).
+
+**Why gating helps:** \(\mathrm{SiLU}(b_i)\) creates **sparse-ish but smooth** modulation of \(a_i\). Large negative \(b_i\) suppresses \(a_i\) without a hard zero (contrast ReLU on \(a\) alone); large positive \(b_i\) lets \(a_i\) pass. Across the batch, different tokens activate different subsets of channels—**adaptive computation** in width without explicit routing layers.
+
+---
+
+## SiLU / Swish: Smooth Gating
+
+**Definition:**
+
+\[
+\mathrm{SiLU}(z) = z \cdot \sigma(z).
+\]
+
+**Derivatives (chain rule for training):**
+
+\[
+\frac{\mathrm{d}}{\mathrm{d}z}\mathrm{SiLU}(z)
+= \sigma(z) + z\,\sigma(z)(1-\sigma(z))
+= \sigma(z)\,\bigl(1 + z(1-\sigma(z))\bigr).
+\]
+
+Smooth nonlinearity avoids **ReLU dead zones** on the gate path; unlike GELU on the **value** path only, the **product** SiLU\(\odot\) allows **multiplicative** interactions **before** the down-projection—empirically strong for LM quality at scale.
+
+---
+
+## Parameter Budget: The \(8d/3\) Rule
+
+SwiGLU uses **three** matrices of shapes \(d\times d_{\text{ff}}\) (up and gate) and \(d_{\text{ff}}\times d\) (down):
+
+\[
+|\theta|_{\text{SwiGLU}} \;=\; 3 d d_{\text{ff}}.
+\]
+
+Match the parameter count of a standard MLP with inner width \(d_{\text{ff}}^{\text{(std)}} = 4d\):
+
+\[
+3 d d_{\text{ff}}^{\text{(swi)}} \;=\; 2 d \cdot (4d)
+\quad\Rightarrow\quad
+d_{\text{ff}}^{\text{(swi)}} \;=\; \frac{8}{3}\,d.
+\]
+
+So **replacing** a ReLU/GELU \(4d\) FFN with SwiGLU **without** increasing total footprint suggests **shrinking** inner width from **\(4d\)** to **\(8d/3\)**.
+
+---
+
+## FLOPs Accounting (Per Token)
+
+A common multiply-add count for a matrix product of shapes **(1,d)** times **(d, d\_{\text{ff}})** is **\(2\,d\,d_{\text{ff}}\)** FLOPs (same for **(d\_{\text{ff}},d)** on the backward or transposed).
+
+**Standard FFN (forward, one token):**
+
+\[
+\text{FLOPs}_{\text{std}} \;=\; 2 d d_{\text{ff}}^{\text{(std)}} + 2 d_{\text{ff}}^{\text{(std)}} d
+\;=\; 4 d d_{\text{ff}}^{\text{(std)}}.
+\]
+
+**SwiGLU:**
+
+\[
+\text{FLOPs}_{\text{Swi}} \;=\; 2 d d_{\text{ff}} + 2 d d_{\text{ff}} + 2 d d_{\text{ff}}
+\;=\; 6 d d_{\text{ff}}.
+\]
+
+Set \(6 d d_{\text{ff}}^{\text{(swi)}} = 4 d d_{\text{ff}}^{\text{(std)}}\) with \(d_{\text{ff}}^{\text{(std)}}=4d\):
+
+\[
+d_{\text{ff}}^{\text{(swi)}} \;=\; \frac{4}{6}\cdot 4d \;=\; \frac{2}{3}\cdot 4d \;=\; \frac{8d}{3}.
+\]
+
+So the **same** **8/3** inner width balances **both** parameters **and** this forward **FLOP** tally against the canonical \(4d\) two-matrix baseline.
+
+---
+
+## LLaMA-3 8B: \(d_{\text{ff}} = 14336\)
+
+Public architecture cards often list **\(d=4096\)** and **\(d_{\text{ff}}=14336\)** for LLaMA-3 8B-class stacks (exact recipe varies by tier). Note:
+
+\[
+\frac{14336}{4096} = 3.5
+\quad\text{(i.e. \(d_{\text{ff}} = 3.5\,d\)).}
+\]
+
+This is **wider** than \(8/3 \approx 2.67\)—a deliberate **over-capacity** choice: more FFN FLOPs and parameters per layer vs the “matched-to-4d-baseline” recipe, **buying accuracy** (especially factual/extractive behavior that correlates with MLP capacity).
+
+**Illustrative per-layer FFN parameter slice (no bias, counts match \(\mathbb{R}^{d\times d_{\text{ff}}}\) layouts):**
+
+\[
+3 \times 4096 \times 14336 \;\approx\; 1.76\times 10^8 \ \text{params per layer.}
+\]
+
+Across \(L\) layers, FFN dominates total parameter mass in dense decoder LMs (often on the order of 60–75% of weights depending on \(L\), \(d\), and attention sharding).
+
+---
+
+## ReLU vs GELU vs SwiGLU (Qualitative)
+
+| Activation style | Behavior | Typical LLM-era notes |
+|------------------|----------|------------------------|
+| **ReLU** | Hard zero for \(z<0\); cheap | Dead units; piecewise linear → worse LM scaling vs smooth gates |
+| **GELU** | Smooth, probabilistic mix | Strong baseline in BERT/GPT eras; no multiplicative gate path |
+| **SwiGLU** | Piecewise **product** structure | Often **best quality** at equal budget among MLP variants when width tuned |
+
+Empirically (large-scale LM pretraining), ordering is commonly reported as **SwiGLU > GELU > ReLU**, with SwiGLU’s gain tied to **gated feature routing** rather than smoothness alone.
+
+---
+
+## Key–Value Memory View
+
+Ignoring biases, expand the down-projection row-wise:
+
+\[
+y \;=\; \sum_{i=1}^{d_{\text{ff}}} h_i\, W_{\text{down}}[i,:]
+\;=\; \sum_{i=1}^{d_{\text{ff}}}
+\left(\mathrm{SiLU}(b_i)\cdot a_i\right)\, W_{\text{down}}[i,:].
+\]
+
+Each inner unit \(i\) contributes a **rank-one** update to \(y\) scaled by a **gated score**. Interpret \(W_{\text{down}}[i,:]\) as **value vectors** and the gate/value interaction as **address-dependent** read strength—conceptually closer to a **content-addressed** collection of static patterns than a single fixed activation curve.
+
+---
+
+## NUMERICAL EXAMPLES
+
+**Inner width comparison** for \(d=4096\):
+
+- Baseline \(4d\) standard MLP: \(d_{\text{ff}}=16384\), params \(2\cdot 4096\cdot 16384 \approx 1.34\times 10^8\).
+- Matched SwiGLU width \(8d/3\): \(d_{\text{ff}} \approx 10922.7\) (rounded in practice to hardware multiples) → same \(\sim 1.34\times 10^8\) param budget when equality holds exactly.
+
+**LLaMA-3 style width \(14336\):**
+
+\[
+3\cdot 4096 \cdot 14336 \approx 1.76\times 10^8\ \text{params},
+\quad
+\text{FLOPs}_{\text forward}\approx 6\cdot 4096 \cdot 14336 \approx 3.52\times 10^8.
+\]
+
+**Gating magnitude:** if \(b_i=-2\), \(\sigma(b_i)\approx 0.12\), \(\mathrm{SiLU}(b_i)\approx -0.24\) (small negative gate allows “soft veto” of opposing-signed \(a_i\)); if \(b_i=2\), \(\mathrm{SiLU}(b_i)\approx 1.76\).
+
+---
+
+## Pseudocode
 
 ```
-STANDARD FFN (2 matrices):
-  d × d_ff + d_ff × d = 2 × d × d_ff  parameters
-  For d_ff = 4d:  2 × d × 4d = 8d²  parameters
+function silu(z):
+    return z * sigmoid(z)
 
-SWIGLU FFN (3 matrices):
-  d × d_ff  (W₁: gate)
-  d × d_ff  (W_gate: gate signal)
-  d_ff × d  (W₂: down)
-  = 3 × d × d_ff  parameters (for square down projection)
-  
-  TO MATCH standard FFN parameter count:
-    3 × d × d_ff = 8d²
-    d_ff = 8d²/(3d) = (8/3)d ≈ 2.67d
-  
-  LLaMA uses d_ff = 8d/3 rounded to the nearest multiple of 256:
-    d = 4096 → 8×4096/3 = 10922.7 → rounded → 10880 or 11008
-    
-  LLaMA-3 8B uses d_ff = 14336:
-    → 14336/4096 = 3.5×  (bigger than 2.67× for capacity reason)
-    Parameter count check: 3 × 4096 × 14336 = 176.2M per layer
-                          × 32 layers = 5.64B (in FFN alone → 70% of model!)
+def ffn_standard(x, W1, W2, phi):        # x: [batch, d]
+    h = phi(matmul(x, W1))               # [batch, d_ff]
+    return matmul(h, W2)                 # [batch, d]
 
-ACTIVATION PATTERN COMPARISON:
-  Position:     -4   -3   -2   -1    0    1    2    3    4
-  ReLU:          0    0    0    0    0   1.0  2.0  3.0  4.0
-  GELU:        ~0   ~0  -0.05  -0.16  0  0.84  1.95  3.0  4.0
-  Swish:       ~0   ~0  -0.09  -0.28  0  0.73  1.76  2.86  3.93
-  
-  Swish has a SMALL NEGATIVE REGION near x ≈ −1.28 (minimum ≈ −0.28)
-  This allows neurons to "vote down" features slightly, not just gate them off.
-  Empirically: SwiGLU > GELU > ReLU for large language models.
-```
+def ffn_swiglu(x, W_up, W_gate, W_down):
+    a = matmul(x, W_up)                  # value path
+    b = matmul(x, W_gate)                # gate logits
+    h = silu(b) * a                      # elementwise combine
+    return matmul(h, W_down)
 
-## 4. Information Flow Through FFN
-
-```
-COMPOSITION WITH ATTENTION IN TRANSFORMER LAYER:
-  
-  Input:  x ∈ ℝ^d  (token representation after attention)
-
-  GATE PATH:   x → x·W_gate → Swish(·) → swish_scores ∈ ℝ^{d_ff}
-  LINEAR PATH: x → x·W₁    →              gate_values ∈ ℝ^{d_ff}
-  HADAMARD:    hidden = swish_scores ⊙ gate_values ∈ ℝ^{d_ff}
-  DOWN PROJ:   output = hidden · W₂ ∈ ℝ^d
-
-VISUAL (d=4, d_ff=8 for illustration):
-  Input x=[x₁,x₂,x₃,x₄]
-        │          │
-        │ W₁        │ W_gate
-        ↓          ↓
-  [h₁,...,h₈]  [g₁,...,g₈]  (expanded to d_ff=8)
-        │          │ Swish(·)
-        │          ↓
-  h⊙Swish(g) = [h₁·σ̃(g₁),...,h₈·σ̃(g₈)]   (selective information flow!)
-               │
-               │ W₂  (project back to d=4)
-               ↓
-  output ∈ ℝ^4
-
-INTERPRETATION:
-  Each of the d_ff neurons represents a "fact" or "feature pattern".
-  The gate determines WHICH patterns are relevant for this token.
-  The linear path determines WHAT value those patterns contribute.
-  → Dynamic routing: different tokens activate different neuron subsets.
-```
-
-## 5. Key-Value Memory Interpretation — Mathematical Proof
-
-```
-CLAIM (Geva et al. 2021): FFN(x) = ∑_i α_i · v_i  (weighted sum of "memory values")
-
-PROOF for SwiGLU:
-  output = (x·W₁ ⊙ Swish(x·W_gate)) · W₂
-         = ∑_{i=1}^{d_ff} [(x·W₁)_i × Swish((x·W_gate)_i)] × W₂[i,:]
-  
-  Let:
-    keys_1 = W₁[:,i]  (column i of W₁, shape ℝ^d)
-    keys_g = W_gate[:,i]  (column i of W_gate)
-    value_i = W₂[i,:]  (row i of W₂, shape ℝ^d)
-  
-  Then:
-    (x·W₁)_i = x · keys_1_i     (match query x against key_1)
-    (x·W_gate)_i = x · keys_g_i (match query x against gate key)
-    α_i = (x·keys_1_i) × Swish(x·keys_g_i)   (gated coefficient)
-  
-  output = ∑_i α_i × value_i   ■
-
-NEURON ANALYSIS:
-  Neurons in middle layers ≈ factual recall
-  ("Paris" concept → activates "capital city" neuron → outputs "France" direction)
-  
-  Neurons in last layers ≈ task-specific processing
-  ("The answer is" → activates "enumerate" neuron → structures output format)
-  
-  ~70% of model parameters live in FFN layers (for d_ff=3.5×d)
-  FFN = the model's "knowledge store"
-  Attention = the model's "reasoning / routing" mechanism
+# Width recipe for "match 4d baseline" SwiGLU (no bias):
+def matched_ffn_width(d: int) -> int:
+    return round_to_multiple(8 * d / 3, multiplicity=64)  # e.g. TP/alignment
 ```
 
 ---
 
-## Exercises
+## Backward Pass Sketch
 
-1. Derive the parameter count ratio (SwiGLU vs standard ReLU FFN) and show that setting d_ff = 8d/3 makes them equal.
-2. Prove that Swish(x) = x·σ(x) is smooth (infinitely differentiable) and compute d/dx[Swish(x)].
-3. In the key-value memory interpretation, how many "memories" are stored in LLaMA-3 8B's FFN? (32 layers × d_ff = 14336 neurons per layer.) What is the total memory capacity in terms of d-dimensional vectors?
+Let \(h_i = \mathrm{SiLU}(b_i)\,a_i\) with \(a = x W_{\text{up}}\), \(b = x W_{\text{gate}}\). Then
+
+\[
+\frac{\partial h_i}{\partial a_i} = \mathrm{SiLU}(b_i),
+\qquad
+\frac{\partial h_i}{\partial b_i} = a_i \cdot \sigma(b_i)\bigl(1 + b_i(1-\sigma(b_i))\bigr).
+\]
+
+Backprop through \(y = h W_{\text{down}}\) routes \(\partial L/\partial h\) into **both** upstream matrices:
+
+\[
+\frac{\partial L}{\partial W_{\text{up}}}
+\;=\; x^\top \left(\frac{\partial L}{\partial h} \odot \mathrm{SiLU}(b)\right),
+\qquad
+\frac{\partial L}{\partial W_{\text{gate}}}
+\;=\; x^\top \left(\frac{\partial L}{\partial h} \odot a \odot \mathrm{SiLU}'(b)\right).
+\]
+
+The gate path carries gradients even when \(a_i\) is small—**unlike** ReLU-gated variants that hard-stop negative pre-activations on the **value** path. This smoothed coupling is part of why optimization at scale is tractable.
+
+---
+
+## COMMON MISTAKES
+
+- ❌ Claim SwiGLU needs **\(4d\)** inner width “like GPT-2” **without** adjusting for the **third** matrix.  
+  ✓ Either set \(d_{\text{ff}} \approx 8d/3\) for parity, or **own** the higher compute of wider stacks.
+
+- ❌ Confuse **SiLU gate** with **sigmoid-only GLU** \(a\odot \sigma(b)\). Different gating curvature; LLaMA uses **SiLU** on gate as in **SwiGLU**.  
+
+- ❌ Forget **layout & fused kernels**: math counts param tensors as \(3 d d_{\text{ff}}\); **implementation** may pack \(W_{\text{gate}}\) and \(W_{\text{up}}\) for bandwidth.
+
+- ❌ Assume “\(3.5d\) expansion” is **mandatory** for quality—it's a **model-line** choice; smaller widths still train strong models with different \(L,d,N\) trade-offs.
+
+- ❌ Compare activations at **fixed random init**; ranking emerges after **large-scale** training—not from one forward pass.
+
+---
+
+## EXERCISES
+
+1. **Parameters:** Derive \(d_{\text{ff}} = 8d/3\) by equating \(3 d d_{\text{ff}}\) to \(2 d \cdot 4d\). Plug \(d=2048\); give a rounded multiple-of-128 width.
+
+2. **FLOPs ratio:** For general \(d_{\text{ff}}\), show \(\text{FLOPs}_{\text{Swi}}/\text{FLOPs}_{\text{std}} = 1.5\) when both use the **same** \(d_{\text{ff}}\). Then show equality when \(d_{\text{ff}}^{\text{(Swi)}} = \tfrac{2}{3} d_{\text{ff}}^{\text{(std)}}\).
+
+3. **Derivatives:** For scalar \(h_i=\mathrm{SiLU}(b_i)\cdot a_i\), write \(\partial h_i/\partial a_i\) and \(\partial h_i/\partial b_i\).
+
+4. **Memory capacity (rough):** If each of \(d_{\text{ff}}\) units stores one \(d\)-dim value row in \(W_{\text{down}}\), how many distinct value vectors sit in one layer at \(d_{\text{ff}}=14336\)? How many across **32** layers (order-of-magnitude **integer** count, ignoring interference)?
+
+5. **Quality vs budget:** Explain when a team might pick \(d_{\text{ff}}=3.5d\) over \(8d/3\) **despite** higher FLOPs per token.
+
+---
+
+## REFERENCES
+
+- Noam Shazeer, *GLU Variants Improve Transformer* (2020).  
+- LLaMA / LLaMA 3 technical reports (Meta) for reported widths and norms.  
+- Geva et al. on key-value / factual structure in FFN layers (interpretability).

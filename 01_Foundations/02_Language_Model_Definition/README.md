@@ -1,186 +1,280 @@
-# 02 — Language Model Definition
+# Understanding Language Models: Definition and Loss Function
 
-## 1. Formal Definition
+*The core identity P(w₁,...,wₙ) = ∏ P(wₜ|w<t) — from probability to training objective*
 
-```
-A LANGUAGE MODEL is a probability distribution over token sequences:
+---
 
-  P_θ: V* → [0, 1]   (maps any finite sequence to a probability)
+## Table of Contents
 
-where V* = ∪_{n≥0} Vⁿ is the set of all finite sequences over vocabulary V.
+1. [Overview](#1-overview)
+   - [1.1 What IS a Language Model?](#11-what-is-a-language-model)
+   - [1.2 Autoregressive Factorisation](#12-autoregressive-factorisation)
+2. [The Chain Rule of Probability](#2-the-chain-rule-of-probability)
+   - [2.1 Derivation](#21-derivation)
+   - [2.2 Why Autoregressive (Left-to-Right)?](#22-why-autoregressive-left-to-right)
+3. [Negative Log-Likelihood (NLL) Loss](#3-negative-log-likelihood-nll-loss)
+   - [3.1 Maximum Likelihood Estimation](#31-maximum-likelihood-estimation)
+   - [3.2 NLL as the Training Objective](#32-nll-as-the-training-objective)
+   - [3.3 Numerical Example](#33-numerical-example)
+4. [Perplexity](#4-perplexity)
+   - [4.1 Definition and Intuition](#41-definition-and-intuition)
+   - [4.2 Relationship to Cross-Entropy](#42-relationship-to-cross-entropy)
+   - [4.3 Interpreting PPL Values](#43-interpreting-ppl-values)
+5. [Common Mistakes](#5-common-mistakes)
+6. [Exercises](#6-exercises)
 
-VALID DISTRIBUTION requirements:
-  (i)  P_θ(w₁,...,wₙ) ≥ 0            for all sequences
-  (ii) ∑_{all sequences} P_θ(w) = 1  (normalises over all possible strings)
+---
 
-By the chain rule:
-  P_θ(w₁,...,wₙ) = ∏_{t=1}^{n} P_θ(wₜ | w₁,...,wₜ₋₁)
+## 1. Overview
 
-So specifying a LM = specifying P_θ(next token | all previous tokens)
-
-AUTOREGRESSIVE GENERATION:
-  ┌────────────────────────────────────────────────────────────────┐
-  │ Step 1: x = [BOS]                                              │
-  │ Step 2: P_θ(w₁|BOS) → sample w₁                               │
-  │ Step 3: P_θ(w₂|BOS,w₁) → sample w₂                            │
-  │ ...                                                            │
-  │ Step t: P_θ(wₜ|w₁,...,wₜ₋₁) → sample wₜ                      │
-  │ Stop when wₜ = EOS                                             │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## 2. Neural LM — Softmax Distribution
+### 1.1 What IS a Language Model?
 
 ```
-The Transformer produces logit vector z(context) ∈ ℝ^{|V|} for each context.
-
-SOFTMAX converts logits to probabilities:
-  P_θ(wₜ = k | context) = exp(zₖ) / ∑_{j=1}^{|V|} exp(zⱼ)
-
-PROPERTIES of softmax:
-  (i)  exp(zₖ) > 0  for all k → all probabilities positive ✓
-  (ii) ∑_k exp(zₖ)/∑_j exp(zⱼ) = 1  → valid distribution ✓
-
-NUMERICAL STABILITY — log-sum-exp trick:
-  Direct computation: exp(z) can OVERFLOW for z > 88 (float32 max ≈ 3.4×10³⁸)
-  
-  Stable computation:
-    m = max(z)   ← find the maximum logit
-    log ∑_k exp(zₖ) = m + log ∑_k exp(zₖ − m)
-                        ↑ now all exponents ≤ 0 → no overflow
-  
-  EXAMPLE:  z = [1000, 1001, 999]
-    Direct: exp(1000) + exp(1001) + exp(999) = OVERFLOW ✗
-    Stable: m=1001, compute exp(-1)+exp(0)+exp(-2) = 0.368+1.0+0.135 = 1.503
-            ∑ = exp(1001) × 1.503  ← only one large number needed
-
-GRADIENT OF SOFTMAX (critical for training):
-  Let p = softmax(z), loss = −log p_{true} (cross-entropy)
-
-  ∂loss/∂zₖ = pₖ − 1[k = true_token]
-             = pₖ − yₖ   where y = one-hot target
-
-  This CLEAN form is the reason cross-entropy + softmax is used universally.
-  Gradient = prediction error.  Large error → large gradient → fast learning.
+┌─────────────────────────────────────────────────────────────┐
+│  INTUITION                                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  A Language Model assigns a PROBABILITY to any sequence     │
+│  of tokens. Higher probability = more "natural" text.       │
+│                                                             │
+│  P("The cat sat on the mat") = 0.0001   (high — natural)   │
+│  P("Cat the on sat mat the") = 0.000000001 (low — garbage) │
+│                                                             │
+│  EQUIVALENTLY, it predicts the next token given a prefix:   │
+│                                                             │
+│  P(next_token | "The cat sat on the") =                     │
+│    "mat":   0.15                                            │
+│    "floor": 0.08                                            │
+│    "bed":   0.05                                            │
+│    "roof":  0.02                                            │
+│    ... (128,256 tokens in vocabulary, all sum to 1.0)       │
+│                                                             │
+│  AN LLM IS: a neural network that estimates this P(·|·).   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## 3. Negative Log-Likelihood Loss — Complete Derivation
+> **Real-World Analogy**: A language model is like autocomplete on your phone. Given "I'm going to the...", it assigns probabilities to all possible next words. The model IS that probability distribution.
+
+### 1.2 Autoregressive Factorisation
 
 ```
-MAXIMUM LIKELIHOOD ESTIMATION (MLE):
-  Given corpus W = (w₁, w₂, ..., w_T), find θ* maximising:
+FULL SEQUENCE PROBABILITY (the LLM identity):
 
-  L_ML(θ) = log P_θ(w₁,...,w_T)
-           = ∑_{t=1}^{T} log P_θ(wₜ | w₁,...,wₜ₋₁)   ← by chain rule
+  P(w₁, w₂, ..., wₙ) = P(w₁) × P(w₂|w₁) × P(w₃|w₁,w₂) × ... × P(wₙ|w₁,...,wₙ₋₁)
+                       = ∏ₜ₌₁ⁿ P(wₜ | w₁, ..., wₜ₋₁)
+                       = ∏ₜ₌₁ⁿ P(wₜ | w<t)
 
-  θ* = argmax_θ L_ML(θ) = argmin_θ [−L_ML(θ)]
-
-NEGATIVE LOG-LIKELIHOOD:
-  NLL(θ) = −L_ML(θ) = −∑_{t=1}^{T} log P_θ(wₜ | w<t)
-
-AVERAGED NLL (training loss):
-  ┌──────────────────────────────────────────────────────────────┐
-  │                   T                                          │
-  │          1       ∑                                           │
-  │ L(θ) = − ─  ×   ─  log P_θ(wₜ | w₁,...,wₜ₋₁)              │
-  │          T      t=1                                          │
-  └──────────────────────────────────────────────────────────────┘
-
-WHY AVERAGE over T?
-  Without averaging: loss scales with sequence length → different learning rates
-  needed for different sequence lengths.
-  With averaging: loss is per-token → consistent gradient magnitude regardless of T.
-
-WHY LOG?
-  (i) Converts product of probabilities to sum → numerically stable
-      P(sequence) = ∏ P(wₜ|...) can be as small as 0.5^{1000} = 10^{-301}
-      log P = ∑ log P(wₜ|...) stays in reasonable range
-
-  (ii) Maximising ∏ P(wₜ) is equivalent to maximising ∑ log P(wₜ)
-       (log is monotonically increasing, so argmax is preserved)
-  
-  (iii) log P is bounded above by 0:  log P ∈ (−∞, 0]
-        so −log P ∈ [0, +∞) → suitable as a minimisation objective
-```
-
-## 4. Perplexity — Full Mathematical Treatment
-
-```
-DEFINITION:
-  PPL(W) = exp( L(θ) )
-         = exp( −(1/T) ∑_{t=1}^{T} log P_θ(wₜ | w<t) )
-
-EQUIVALENT FORMS:
-  PPL = exp(H_cross-entropy per token)
-      = 2^{H_bits per token}    (in bits using log₂)
-      = P_θ(W)^{−1/T}           (T-th root of inverse probability)
-
-PROOF of P^{-1/T} form:
-  PPL = exp(−(1/T) log P)
-      = exp(log P^{-1/T})
-      = P^{-1/T}   ■
-
-INTUITION — "branching factor":
-  If the model assigns uniform probability to B tokens at each step:
-    P(wₜ) = 1/B  for each token
-    L(θ) = −(1/T) ∑ log(1/B) = log B
-    PPL = exp(log B) = B
-
-  So PPL = B means "the model is as confused as if choosing uniformly from B options"
-
-NUMERICAL EXAMPLE:
-  4-token sequence: log-probs = [−0.5, −1.2, −0.3, −0.8]
-  
-  Step 1: Average = (0.5 + 1.2 + 0.3 + 0.8) / 4 = 0.7
-  Step 2: PPL = exp(0.7) = 2.01
-
-  "The model's effective branching factor is about 2 — it nearly always knows the next token."
-
-PPL REFERENCE SCALE:
-  PPL value │ Meaning
-  ──────────┼──────────────────────────────────────────────
-  PPL = 1   │ Perfect model (impossible without memorisation)
-  PPL = 2   │ Excellent (~1 bit uncertainty per token)
-  PPL = 10  │ Good (knows top 10 candidates well)
-  PPL = 100 │ Struggling
-  PPL = |V| │ Uniform — no better than random
-  PPL = 50K │ For typical LLM vocab: completely random
-
-  REAL MODEL PPLs (WikiText-103):
-  GPT-2 (124M): 37  │  LLaMA-3 (8B): ~7  │  LLaMA-3 (70B): ~5
-```
-
-## 5. Cross-Entropy Loss vs NLL
-
-```
-For one token position t with true token y and model distribution q = P_θ(·|context):
-
-  True distribution:  p = one-hot vector  (1 at index y, 0 elsewhere)
-  Model distribution: q = softmax(z)
-
-CROSS-ENTROPY:
-  H(p, q) = −∑_k p(k) log q(k)
-           = −log q(y)         ← since p(k) = 1 only at k=y
-           = −log P_θ(y | context)
-           = NLL for this token ✓
-
-They are IDENTICAL when target is one-hot. Training cross-entropy = NLL.
-
-RELATION TO KL DIVERGENCE:
-  H(p, q) = H(p) + KL(p ‖ q)
-  ↑                ↑       ↑
-  cross-entropy   entropy  additional gap
-
-  Since p is one-hot: H(p) = 0
-  So H(p,q) = KL(p ‖ q) for one-hot targets.
-  
-  Minimising NLL ≡ minimising KL(p_true ‖ p_model) ← makes the model match the data distribution.
+  This is EXACT (no approximation!) — it's the chain rule of probability.
+  Every autoregressive LLM models exactly this factorisation.
 ```
 
 ---
 
-## Exercises
+## 2. The Chain Rule of Probability
 
-1. Show that for a uniform model PPL = |V|. Use the formula PPL = exp(−(1/T) ∑ log P) with P = 1/|V|.
-2. Given a 4-token sequence with log-probs −1, −2, −1, −3, compute L and PPL step by step.
-3. If you compress text with an LM of PPL P, the optimal compression rate is log₂(P) bits/token. For PPL=30, how many bits per token? Compare to ASCII encoding (8 bits/char ≈ 1.5 chars/token → ~12 bits/token).
+### 2.1 Derivation
+
+```
+CHAIN RULE (from basic probability axioms):
+
+  P(A, B) = P(A) × P(B|A)                    (definition of conditional)
+  P(A, B, C) = P(A) × P(B|A) × P(C|A,B)     (apply twice)
+  P(w₁,...,wₙ) = ∏ₜ P(wₜ | w<t)             (apply n-1 times)
+
+  This holds for ANY joint distribution — no assumptions needed.
+  The LLM's job: learn a neural network that approximates each P(wₜ|w<t).
+
+EXAMPLE:
+  P("The cat sat") = P("The") × P("cat"|"The") × P("sat"|"The cat")
+                   ≈ 0.05   ×    0.02          ×     0.03
+                   = 0.00003
+
+  log P("The cat sat") = log(0.05) + log(0.02) + log(0.03)
+                        = -3.0 + -3.9 + -3.5 = -10.4
+```
+
+### 2.2 Why Autoregressive (Left-to-Right)?
+
+```
+ALTERNATIVES and why autoregressive wins for generation:
+
+  Masked LM (BERT): P(w_t | w_1,...,w_{t-1}, w_{t+1},...,w_n)
+    Can see BOTH past and future! Good for understanding.
+    BUT: cannot generate text left-to-right (needs future context).
+    
+  Autoregressive (GPT): P(w_t | w_1,...,w_{t-1})
+    Only sees the past. Can generate token by token!
+    Training: teacher forcing (feed ground truth prefix, predict next).
+    Inference: sample one token, append, repeat.
+
+  WHY LEFT-TO-RIGHT (not right-to-left)?
+    Language is read/written left-to-right (in English).
+    Either direction is mathematically valid (chain rule is symmetric).
+    XLNet showed right-to-left and permutation orderings work too.
+    Convention: left-to-right is simplest and fastest for generation.
+```
+
+---
+
+## 3. Negative Log-Likelihood (NLL) Loss
+
+### 3.1 Maximum Likelihood Estimation
+
+```
+GOAL: find parameters θ that maximise P_θ(training data).
+
+  θ* = argmax_θ  P_θ(D)
+     = argmax_θ  ∏_{(x,y) ∈ D} P_θ(y|x)
+     = argmax_θ  Σ_{(x,y) ∈ D} log P_θ(y|x)    (log is monotone)
+     = argmin_θ  -Σ_{(x,y) ∈ D} log P_θ(y|x)   (flip sign to minimise)
+     = argmin_θ  NLL(θ)
+```
+
+### 3.2 NLL as the Training Objective
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  NLL LOSS (the LLM training objective):                      │
+│                                                              │
+│  L(θ) = -(1/T) × Σₜ₌₁ᵀ log P_θ(wₜ | w<t)                  │
+│                                                              │
+│  where T = total number of tokens in the batch              │
+│  and P_θ(wₜ|w<t) = softmax(logits)[wₜ]                      │
+│                                                              │
+│  GRADIENT:                                                   │
+│  ∂L/∂θ = -(1/T) × Σₜ (1/P_θ(wₜ|w<t)) × ∂P_θ(wₜ|w<t)/∂θ   │
+│                                                              │
+│  In practice: cross-entropy between one-hot(wₜ) and P_θ(·|w<t)│
+│  L(θ) = -(1/T) × Σₜ Σᵥ one_hot(wₜ)[v] × log P_θ(v|w<t)   │
+│        = -(1/T) × Σₜ log P_θ(wₜ|w<t)   (since one_hot selects one term)│
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 Numerical Example
+
+```
+EXAMPLE: vocabulary = {"the":0, "cat":1, "sat":2, "on":3}
+
+  Sequence: "the cat sat on" (4 tokens)
+  
+  At position 1 (predicting "cat" given "the"):
+    Model logits: [1.2, 2.5, 0.3, -0.5]
+    Softmax:      [0.14, 0.51, 0.06, 0.03] (sums to ~0.74 + normalisation)
+    P("cat"|"the") = 0.51
+    -log P = -log(0.51) = 0.67
+  
+  At position 2 (predicting "sat" given "the cat"):
+    P("sat"|"the cat") = 0.35
+    -log P = -log(0.35) = 1.05
+  
+  At position 3 (predicting "on" given "the cat sat"):
+    P("on"|"the cat sat") = 0.45
+    -log P = -log(0.45) = 0.80
+
+  NLL = (0.67 + 1.05 + 0.80) / 3 = 0.84
+
+  INTERPRETATION: on average, the model assigns exp(-0.84) = 0.43 
+  probability to the correct next token. Lower NLL = better model.
+```
+
+---
+
+## 4. Perplexity
+
+### 4.1 Definition and Intuition
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  PERPLEXITY (PPL) = exp(NLL) = exp(-(1/T) Σₜ log P(wₜ|w<t))│
+│                                                              │
+│  INTUITION: "how many tokens is the model choosing between  │
+│  at each step, on average?"                                  │
+│                                                              │
+│  PPL = 1:      model is PERFECT (always P=1 for correct)    │
+│  PPL = 10:     like choosing uniformly from 10 options       │
+│  PPL = 100:    like choosing from 100 options (uncertain)    │
+│  PPL = |V|:    uniform over vocabulary (knows nothing)       │
+│                                                              │
+│  For LLaMA-3 8B on standard benchmarks: PPL ≈ 6-8           │
+│  → The model narrows down the next token to ~7 candidates   │
+│    on average (out of 128,256 in the vocabulary!)            │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Relationship to Cross-Entropy
+
+```
+MATHEMATICAL CONNECTION:
+
+  Cross-entropy: H(p, q) = -Σₓ p(x) log q(x)
+  NLL = empirical cross-entropy = H(p_data, P_θ)
+  PPL = exp(H(p_data, P_θ)) = 2^{H in bits}
+
+  If we use bits (log₂): PPL = 2^{cross-entropy in bits}
+  If we use nats (ln):   PPL = e^{cross-entropy in nats}
+  
+  Standard: use natural log → PPL = exp(NLL in nats).
+```
+
+### 4.3 Interpreting PPL Values
+
+```
+TYPICAL PERPLEXITIES:
+
+| Model | PPL (WikiText) | What it means |
+|-------|---------------|---------------|
+| Random (|V|=128K) | 128,256 | Knows nothing |
+| N-gram (n=5) | ~80 | Captures local statistics |
+| LSTM (1B params) | ~25 | Understands sentences |
+| GPT-2 (1.5B) | ~18 | Good language model |
+| LLaMA-2 7B | ~7.5 | Strong language model |
+| LLaMA-3 8B | ~6.2 | State-of-the-art for size |
+| GPT-4 (~1.8T?) | ~4-5 | Near human-level fluency |
+
+IMPORTANT: PPL is dataset-dependent! 
+  PPL on code ≠ PPL on prose ≠ PPL on dialogue.
+  Always compare on the SAME evaluation set.
+```
+
+---
+
+## 5. Common Mistakes
+
+```
+❌ WRONG: Lower perplexity always means better downstream performance
+✓ RIGHT:  PPL measures next-token prediction quality (average over ALL tokens).
+          A model good at predicting "the" and "a" (frequent) can have low PPL
+          while being bad at harder tasks (reasoning, math, coding).
+          PPL is necessary but not sufficient for task quality.
+
+❌ WRONG: Training loss = NLL = cross-entropy are all different things
+✓ RIGHT:  For autoregressive LLMs, they are ALL THE SAME:
+          Training loss = NLL = cross-entropy(one_hot, model_distribution)
+          These are just different names for -(1/T) Σ log P(wₜ|w<t).
+
+❌ WRONG: The model is trained to predict one specific next token
+✓ RIGHT:  The model is trained to output a DISTRIBUTION over all tokens.
+          The loss pushes it to assign HIGH probability to the correct token.
+          Many tokens may be valid continuations ("I went to the [store/park/...]").
+
+❌ WRONG: PPL of 6 means the model always has 6 candidates
+✓ RIGHT:  PPL is a GEOMETRIC MEAN. For some tokens P≈0.99 (very predictable:
+          "New" → "York"), for others P≈0.01 (creative positions: "The story
+          was about a..."). PPL=6 is the average across all positions.
+```
+
+---
+
+## 6. Exercises
+
+1. **NLL Computation**: For the sequence "I love cats" with P("I")=0.1, P("love"|"I")=0.05, P("cats"|"I love")=0.02: compute NLL (in nats) and perplexity.
+
+2. **Perplexity Interpretation**: Model A has PPL=8 on news articles, PPL=25 on code. Model B has PPL=10 on news, PPL=12 on code. Which model is "better"? Why is this question ill-defined?
+
+3. **Loss Landscape**: If a model assigns P=1/|V|=1/128256 to every token uniformly, what is its PPL? How does this compare to a model that has memorised the training data perfectly (P=1 for correct token)?
+
+4. **Chain Rule Verification**: For a 3-token sequence "A B C", verify that P(A,B,C) = P(A)P(B|A)P(C|A,B) using a concrete example. What happens to log P(A,B,C) as sequence length grows?

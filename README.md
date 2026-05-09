@@ -1,6 +1,6 @@
 # Understanding Large Language Models: A Mathematical Deep Dive
 
-*A comprehensive, chapter-by-chapter guide to LLMs — from probability basics to scaling laws*
+*A comprehensive, chapter-by-chapter guide to LLMs — from probability basics to agents and multimodal systems*
 
 ---
 
@@ -67,10 +67,15 @@ READING PATHS:
     Ch 1 (Probability basics) → 7 (Fine-Tuning)
 
   Just inference:
-    Ch 4 (Attention) → 8 (Inference)
+    Ch 4 (Attention) → 8 (Inference) → 13 (Quantization)
 
   Just scaling:
-    Ch 6 (Pre-training) → 9 (Scaling Laws)
+    Ch 6 (Pre-training) → 9 (Scaling Laws) → 16 (Distributed Training)
+
+  Advanced topics (after completing core chapters):
+    Ch 10 (MoE) → 11 (Reasoning) → 12 (Long Context)
+    Ch 13 (Quantization) → 14 (Distillation)
+    Ch 15 (Multimodal) → 17 (RAG) → 18 (Agents)
 ```
 
 Each sub-chapter `README.md` follows this structure:
@@ -165,6 +170,15 @@ Each sub-chapter `README.md` follows this structure:
 | Why BF16 training | Ch 6.03 |
 | SwiGLU activation | Ch 5.02 |
 | Speculative decoding | Ch 8.04 |
+| MoE routing / gating math | Ch 10 §2 |
+| Chain-of-Thought / MCTS reasoning | Ch 11 §2-4 |
+| YaRN / RoPE context extension | Ch 12 §2.3 |
+| INT4 quantization (GPTQ, AWQ, NF4) | Ch 13 §4 |
+| Knowledge distillation loss | Ch 14 §2 |
+| Vision-Language (CLIP, LLaVA) | Ch 15 §2-4 |
+| Tensor/Pipeline parallelism | Ch 16 §4-5 |
+| RAG retrieval pipeline | Ch 17 §3-4 |
+| ReAct agents / function calling | Ch 18 §2-3 |
 
 ---
 
@@ -279,6 +293,16 @@ A: It does grow linearly. For n tokens, KV cache = O(n × L × d).
 8. **Su et al. (2022)**: "RoFormer: Enhanced Transformer with Rotary PE"
 9. **Dao et al. (2022)**: "FlashAttention: Fast and Memory-Efficient Attention"
 10. **Kwon et al. (2023)**: "Efficient Memory Management for LLM Serving — vLLM"
+11. **Fedus et al. (2022)**: "Switch Transformers: Scaling to Trillion Parameter Models"
+12. **Jiang et al. (2024)**: "Mixtral of Experts" — sparse MoE for LLMs
+13. **Yao et al. (2023)**: "ReAct: Synergizing Reasoning and Acting in LMs"
+14. **Wei et al. (2022)**: "Chain-of-Thought Prompting Elicits Reasoning"
+15. **Peng et al. (2023)**: "YaRN: Efficient Context Window Extension"
+16. **Frantar et al. (2023)**: "GPTQ: Accurate Post-Training Quantization"
+17. **Lin et al. (2024)**: "AWQ: Activation-Aware Weight Quantization"
+18. **Liu et al. (2024)**: "LLaVA: Visual Instruction Tuning"
+19. **Rajbhandari et al. (2020)**: "ZeRO: Memory Optimizations for Training"
+20. **Lewis et al. (2020)**: "Retrieval-Augmented Generation for Knowledge Tasks"
 
 ---
 
@@ -342,6 +366,33 @@ LLM_FineTune/
 │   ├── README.md
 │   ├── 01_Kaplan_Power_Laws/          ← N/D/C power law fits
 │   └── 02_Chinchilla/                 ← D/N≈20, derivation
+│
+├── 10_Mixture_of_Experts/
+│   └── README.md                      ← MoE routing, load balancing, expert parallelism
+│
+├── 11_Reasoning_and_Search/
+│   └── README.md                      ← CoT, ToT, MCTS, PRM, Best-of-N, o1-style
+│
+├── 12_Long_Context/
+│   └── README.md                      ← PI, NTK, YaRN, Ring Attention, sliding window
+│
+├── 13_Quantization/
+│   └── README.md                      ← INT8/INT4, GPTQ, AWQ, NF4, SmoothQuant
+│
+├── 14_Knowledge_Distillation/
+│   └── README.md                      ← KD loss, temperature, synthetic data
+│
+├── 15_Multimodal_LLMs/
+│   └── README.md                      ← CLIP, ViT, LLaVA, vision-language alignment
+│
+├── 16_Distributed_Training/
+│   └── README.md                      ← DP, ZeRO/FSDP, tensor/pipeline parallelism
+│
+├── 17_RAG/
+│   └── README.md                      ← Retrieval-Augmented Generation, embeddings, reranking
+│
+├── 18_Agents_and_Tool_Use/
+│   └── README.md                      ← ReAct, function calling, multi-agent systems
 │
 └── canvases/
     └── llm-bookwise-chapter.canvas.tsx ← Interactive React canvas

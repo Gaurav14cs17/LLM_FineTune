@@ -1,207 +1,342 @@
-# 03 — Emergent Abilities and Phase Transitions
+# Understanding Emergent Abilities in Large Language Models
 
-## 1. Formal Definition of Emergence
+*Phase transitions, threshold effects, and capabilities that appear only at scale*
 
-```
-DEFINITION (Wei et al. 2022):
-  An ability is EMERGENT if it is not present in smaller models but is present in larger models.
-  Formally: there exists a threshold N* such that:
-    performance(N) ≈ random_baseline    for N < N*
-    performance(N) >> random_baseline  for N ≥ N*
+---
 
-MATHEMATICAL CHARACTERISATION:
-  Let P(N) = performance on a task as a function of parameters.
-  
-  NON-EMERGENT (smooth scaling):
-    P(N) = a × N^b  for some a, b > 0
-    ∂P/∂N > 0 for all N → continuous improvement
-  
-  EMERGENT (sharp transition):
-    P(N) ≈ P_chance     for N < N*
-    P(N) >> P_chance    for N ≥ N*
-    
-    The derivative ∂P/∂N is VERY SMALL for N < N* and VERY LARGE near N*.
+## Table of Contents
 
-VISUAL:
-  Performance ↑
-              │                      ████████████████
-              │               ███████
-              │         ██████
-              │     █████
-  P_chance ───├─████
-              └──────────────────────────────────────── log N →
-                        ↑ threshold N* 
+1. [Overview](#1-overview)
+   - [1.1 What Are Emergent Abilities?](#11-what-are-emergent-abilities)
+   - [1.2 The Scaling Paradox](#12-the-scaling-paradox)
+2. [Examples of Emergence](#2-examples-of-emergence)
+   - [2.1 Chain-of-Thought Reasoning](#21-chain-of-thought-reasoning)
+   - [2.2 In-Context Learning](#22-in-context-learning)
+   - [2.3 Word-Level Tasks](#23-word-level-tasks)
+3. [Mathematical Framework](#3-mathematical-framework)
+   - [3.1 Phase Transition Model](#31-phase-transition-model)
+   - [3.2 The Metric Matters Hypothesis](#32-the-metric-matters-hypothesis)
+   - [3.3 Smooth vs Sharp Transitions](#33-smooth-vs-sharp-transitions)
+4. [Debate: Are Emergent Abilities Real?](#4-debate-are-emergent-abilities-real)
+   - [4.1 The Schaeffer et al. Critique](#41-the-schaeffer-et-al-critique)
+   - [4.2 Task Decomposition Argument](#42-task-decomposition-argument)
+5. [Practical Implications](#5-practical-implications)
+   - [5.1 When to Expect Emergence](#51-when-to-expect-emergence)
+   - [5.2 Predicting Capabilities](#52-predicting-capabilities)
+6. [Common Mistakes](#6-common-mistakes)
+7. [Exercises](#7-exercises)
 
-  Before N*: performance = random chance (task completely unsolved)
-  After N*:  rapid improvement as model size increases
-```
+---
 
-## 2. Phase Transition Mathematics — Percolation Theory Analogy
+## 1. Overview
+
+### 1.1 What Are Emergent Abilities?
 
 ```
-ANALOGY: emergence in LLMs is similar to phase transitions in physics.
-
-PERCOLATION TRANSITION (bond percolation):
-  Each bond in a lattice is occupied with probability p.
-  At threshold p_c ≈ 0.5, a connected path suddenly appears (sharp transition).
-  
-  Below p_c: isolated clusters, no long-range connectivity
-  Above p_c: giant connected component spanning the lattice
-
-LLM CAPABILITY ANALOGY:
-  Each additional parameter (or token during training) = adding one bond.
-  "Connectivity" = ability to chain together sub-skills.
-  
-  MATHEMATICAL MODEL (toy):
-    Suppose a complex task requires k sub-skills S₁,...,Sₖ.
-    Model of size N solves each sub-skill with probability f(N).
-    Task is solved when ALL sub-skills are solved:
-    
-    P_task(N) = ∏ᵢ f_i(N)
-    
-    If each f_i grows slowly (near 0 for small N):
-    P_task ≈ 0  (product of small numbers)
-    
-    When N crosses the threshold so that each f_i ≈ 1:
-    P_task → ∏ 1 = 1  (sudden jump!)
-    
-    The transition APPEARS SHARP but is actually a composition of smooth curves.
-
-BIG BENCH HARD TASKS:
-  Tasks like "chain of thought arithmetic" require multiple capabilities:
-  1. Parse numbers correctly
-  2. Apply operator
-  3. Carry results across steps
-  4. Format output correctly
-  5. Stay within token budget
-  
-  P_task = P(parse) × P(operator) × P(carry) × P(format) × P(budget)
-  
-  If each sub-skill develops gradually from N=5B to N=50B:
-    At 5B:  each P ≈ 0.5 → P_task ≈ 0.5^5 = 0.03 (3% ≈ random)
-    At 50B: each P ≈ 0.9 → P_task ≈ 0.9^5 = 0.59 (59%, clearly above chance)
-  
-  The SHARP-LOOKING jump at ~50B is actually a product of 5 smooth curves.
+┌─────────────────────────────────────────────────────────────┐
+│  INTUITION                                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  EMERGENT ABILITY = capability that is:                      │
+│    • ABSENT in small models                                 │
+│    • PRESENT in large models                                │
+│    • NOT predictable by extrapolating small model behaviour │
+│                                                             │
+│  Performance vs Model Size (log scale):                     │
+│                                                             │
+│  Accuracy                                                   │
+│  100% ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ●──── (large)       │
+│                                       /                     │
+│   50% ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─/─ ─ ─ ─               │
+│                                   /                         │
+│   25% ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─/─ ─ ─ ─ ─ ─  SHARP jump!  │
+│                               /                             │
+│    0% ●────●────●────●────●─/─ ─ ─ ─ ─ ─ ─ ─              │
+│        └─── random chance ───┘                              │
+│       1B   3B   7B   13B  30B  65B  175B                    │
+│                  Model size (parameters)                     │
+│                                                             │
+│  Below some threshold: model is at CHANCE LEVEL             │
+│  Above threshold: model suddenly "gets it"                  │
+│  The transition is SHARP, not gradual!                      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## 3. Are Emergent Abilities Real? — Quantitative Analysis
+> **Real-World Analogy**: Water doesn't "gradually boil" — it's liquid at 99°C and gas at 100°C. Similarly, LLMs are at random-chance performance up to some model size, then abruptly become capable at that task.
+
+### 1.2 The Scaling Paradox
 
 ```
-SCHAEFFER ET AL. (2023): "Are Emergent Abilities of Large Language Models a Mirage?"
+PARADOX:
+  Loss scales SMOOTHLY as a power law: L(N) = E + A/N^α
+  BUT task performance shows SHARP jumps at critical scales.
 
-ARGUMENT: Emergence is an artifact of METRIC CHOICE, not model capability.
-
-DICHOTOMOUS METRICS create artificial emergence:
-  "Exact match accuracy" (0 or 1 per example):
-    If task needs 5 correct answers to pass:
-    With 4 correct: accuracy = 0 (fail)
-    With 5 correct: accuracy = 1 (pass)
-    
-    Underlying capability (fraction correct per question) is SMOOTH.
-    But binary pass/fail metric → sharp apparent threshold.
-
-PROOF:
-  Let Xᵢ ~ Bernoulli(p) for i=1,...,k (probability p of getting each sub-question right)
-  Task "passes" if ∑ Xᵢ = k (all must be correct).
+  How can smooth loss → discontinuous capability?
   
-  P(pass | p) = p^k
+  ANSWER: a task may require multiple sub-skills simultaneously.
+  Each sub-skill improves smoothly, but the TASK requires ALL of them.
+  P(task correct) = P(skill_1) × P(skill_2) × ... × P(skill_k)
   
-  This function in p:
-    For p < 0.9: P(pass) < 0.9^k ≈ 0 (for k=5: P < 0.59)
-    At p = 0.95: P(pass) = 0.95^5 = 0.77
-    At p = 0.99: P(pass) = 0.95 ≈ 1
-  
-  For small k: smooth. For large k: appears like a phase transition.
-
-CONTINUOUS METRICS DON'T SHOW EMERGENCE:
-  Using log-probability of correct answer (soft metric):
-    P(correct answer) grows SMOOTHLY with N (no sharp transition)
-  
-  Using BLEU score (continuous):
-    Grows smoothly with N (no sharp transition)
-  
-  CONCLUSION: Emergent abilities are a metric artifact, not a model capability artifact.
-  The underlying capability IS SMOOTH, but the evaluation metric is discontinuous.
-```
-
-## 4. Predictability of Emergent Abilities
-
-```
-IF emergence is a metric artifact, can we PREDICT when it will occur?
-
-METHOD 1 — From individual sub-task curves:
-  Identify sub-tasks T₁,...,Tₖ that collectively constitute the complex task.
-  Fit smooth curves P(Tᵢ | N) for each sub-task.
-  Predict complex task performance: P_task(N) = f(P(T₁),...,P(Tₖ))
-  
-  EXAMPLE: 5-digit arithmetic
-    Sub-tasks: (1-digit add, 2-digit add, 3-digit add, 4-digit add, 5-digit add)
-    Each has a smooth sigmoid-like curve in N.
-    5-digit curve = product of individual improvements → apparent sharp threshold.
-
-METHOD 2 — Extrapolating power laws:
-  Even below the apparent threshold:
-    performance(N) = ε(N) ≈ c × N^d   for some small c, d
-    (Model gets SOME fraction right — just below human-detectable threshold)
-  
-  Fit this curve to small-scale training runs.
-  Extrapolate to predict when performance crosses a quality threshold.
-  
-  This is used in SCALING EXPERIMENTS:
-    Train small models (N=100M, 1B, 10B)
-    Fit power law
-    Predict performance at N=100B WITHOUT training it!
-    
-    Accuracy of prediction: often within 5-10% for well-studied tasks.
-    For rare "emergent" tasks: prediction is harder (exponents change).
-
-METHOD 3 — Chain of Thought unlocking:
-  Some tasks appear emergent at N=100B but are PRESENT at N=10B with Chain-of-Thought.
-  
-  CoT provides the model with the step-by-step "sub-task structure".
-  This bypasses the need for the model to have internalised all sub-skills.
-  → "Emergence" can be made to appear earlier with appropriate prompting!
-```
-
-## 5. Emergent Abilities in Practice — Examples and Thresholds
-
-```
-CONFIRMED EMERGENT ABILITIES (Wei et al. 2022):
-
-Task                                │ Threshold N  │ What changes?
-────────────────────────────────────┼──────────────┼────────────────────────────────
-Multi-digit arithmetic (5-shot)     │ ~100B        │ Correct carryovers at all digits
-3-digit ×3-digit multiplication     │ ~500B        │ Generalises to arbitrary numbers
-Physics Q (college-level)           │ ~50B         │ Uses formulas correctly
-Multi-step word problems (GSM8K)    │ ~50B         │ Chains multiple reasoning steps
-Analogical reasoning (B-Big-Bench)  │ ~10B         │ Identifies abstract patterns
-Word unscrambling                   │ ~100B        │ Orthographic manipulation
-
-MATHEMATICAL THRESHOLD ANALYSIS for multi-digit arithmetic:
-  5-digit addition requires:
-    - Correct digit parsing (appears at ~1B params)
-    - Correct carry logic (appears at ~10B params)
-    - Consistent multi-step application (appears at ~100B params)
-  
-  Each step adds approximately one order of magnitude to the threshold.
-  → k-step tasks need models ~10^k times larger than 1-step tasks (rough rule).
-
-CHAIN-OF-THOUGHT EFFECTS ON THRESHOLDS:
-  Task                        │ Without CoT  │ With CoT
-  ────────────────────────────┼──────────────┼───────────
-  Multi-step math (5 steps)   │ ~100B        │ ~20B  (5× smaller threshold!)
-  Common sense reasoning      │ ~50B         │ ~7B
-  Physics problems            │ ~100B        │ ~40B
-  
-  CoT provides the "sub-task structure" to the model explicitly,
-  bypassing the need for the model to discover it internally.
-  → Each explicit CoT step "saves" roughly one order of magnitude of model capacity.
+  If each skill has sigmoid improvement with scale:
+    Product of sigmoids → SHARPER sigmoid!
+    With k=5 skills: transition is nearly a step function.
 ```
 
 ---
 
-## Exercises
+## 2. Examples of Emergence
 
-1. For a task requiring k=3 sub-skills each with P(sub-skill) = N^{0.1} / N_max^{0.1}, compute the task success probability at N = 0.1, 0.5, and 1.0 × N_max. Show that the combined curve looks like a phase transition.
-2. Explain the Schaeffer et al. argument mathematically: show that a task with "exact match" metric (pass if all k correct) exhibits apparent emergence even when individual probabilities grow smoothly.
-3. If a 5-step task is "emergent" at N=100B, and each step individually is mastered at N=10B, 15B, 20B, 30B, 40B respectively: model P_task(N) as the product of 5 sigmoid functions each centered at the individual thresholds. At what N does P_task exceed 0.5?
+### 2.1 Chain-of-Thought Reasoning
+
+```
+3-DIGIT ADDITION (Wei et al. 2022):
+
+  Model size:    1B   3B   7B   13B   62B   175B
+  Accuracy:      0%   0%   1%   5%    20%   92%
+                 └── at chance ──┘     └─ EMERGENCE ─┘
+
+  WHY EMERGENCE: 3-digit addition requires:
+    1. Understanding "add these numbers" (language skill)
+    2. Aligning digits by place value (spatial reasoning)
+    3. Computing each column sum (arithmetic)
+    4. Carrying between columns (multi-step state tracking)
+    
+  Small models can do 1-2 of these but NOT all 4 simultaneously.
+  At ~60B: all sub-skills reach sufficient quality → task works!
+```
+
+### 2.2 In-Context Learning
+
+```
+FEW-SHOT TASK LEARNING (emergent in GPT-3 175B):
+
+  Prompt: "dog → animal, car → vehicle, piano → "
+  Expected: "instrument"
+
+  GPT-2 (1.5B):   random output (doesn't understand the pattern)
+  GPT-3 (6.7B):   sometimes correct (unreliable)
+  GPT-3 (175B):   correct 85%+ of the time (robust ICL!)
+
+  REQUIREMENT for ICL:
+    1. Recognise the input-output pattern in examples
+    2. Infer the underlying mapping rule
+    3. Apply the rule to the new input
+    4. Generate the correct output format
+    
+  Each sub-skill needs a minimum representation capacity.
+```
+
+### 2.3 Word-Level Tasks
+
+```
+TASKS WITH DOCUMENTED EMERGENCE (BIG-Bench):
+
+| Task | Threshold | Below | Above |
+|------|-----------|-------|-------|
+| 3-digit addition | ~60B | <5% | >90% |
+| Multi-step arithmetic | ~100B | <10% | >70% |
+| Logical deduction (5-step) | ~50B | ~25% | >80% |
+| Persian QA | ~60B | <10% | >50% |
+| Truthful QA | ~100B+ | <30% | >50% |
+| International phonetic alphabet | ~60B | ~0% | >50% |
+```
+
+---
+
+## 3. Mathematical Framework
+
+### 3.1 Phase Transition Model
+
+```
+MODEL FOR EMERGENCE (probabilistic):
+
+  A task requires k independent sub-skills.
+  Each sub-skill i has success probability pᵢ(N) that improves with scale:
+    pᵢ(N) = σ(aᵢ × (log N - log Nᵢ))   (sigmoid)
+    
+  where Nᵢ = critical model size for skill i
+  and aᵢ = steepness of transition.
+
+  TASK SUCCESS = ALL sub-skills succeed:
+    P_task(N) = ∏ᵢ₌₁ᵏ pᵢ(N)
+
+  With k=5 skills, each with threshold around 10B-50B:
+    At N=10B: pᵢ ≈ 0.5 each → P_task = 0.5⁵ = 3% (chance!)
+    At N=60B: pᵢ ≈ 0.9 each → P_task = 0.9⁵ = 59% (capable!)
+    At N=175B: pᵢ ≈ 0.99 each → P_task = 0.99⁵ = 95% (reliable!)
+
+  The PRODUCT of gradual improvements appears SUDDEN.
+```
+
+### 3.2 The Metric Matters Hypothesis
+
+```
+SCHAEFFER et al. (2023) — A DIFFERENT EXPLANATION:
+
+  Emergence might be an ARTEFACT of the evaluation metric!
+
+  CLAIM: with SMOOTH metrics (e.g., token-level log-likelihood),
+  there IS gradual improvement. Only with SHARP metrics 
+  (e.g., exact-match accuracy) does it APPEAR discontinuous.
+
+  EXAMPLE (4-digit multiplication):
+    Model gets "456 × 789 = 359784" (correct answer: 359784)
+    
+    EXACT-MATCH metric:
+      Model says "359784" → score = 1 (fully correct)
+      Model says "359774" → score = 0 (one digit wrong = ZERO!)
+    
+    TOKEN-LEVEL metric:
+      Model says "359774" → 5/6 digits correct = 83% score
+      
+    With exact-match: sharp transition from 0→1
+    With partial credit: gradual improvement is VISIBLE at smaller scales!
+
+┌─────────────────────────────────────────────────────────────┐
+│  IMPLICATION: "emergence" may be partially an artefact of   │
+│  binary (all-or-nothing) evaluation metrics, not a true     │
+│  phase transition in model capabilities.                    │
+│                                                             │
+│  HOWEVER: some tasks genuinely require a minimum capacity   │
+│  threshold that cannot be revealed by partial-credit metrics.│
+│  (e.g., you either understand recursion or you don't.)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 Smooth vs Sharp Transitions
+
+```
+WHEN IS EMERGENCE "REAL" vs METRIC ARTEFACT?
+
+  REAL (capability threshold):
+    - Multi-step reasoning (need ALL steps correct)
+    - In-context learning (need to infer the pattern)
+    - Code execution (one bug = total failure)
+    
+  METRIC ARTEFACT:
+    - Knowledge recall (gradual improvement visible in log-prob)
+    - Translation quality (BLEU improves smoothly)
+    - Summarisation (ROUGE improves gradually)
+
+  PRACTICAL IMPACT:
+    If you're choosing model size for a specific task:
+    - Check if task has documented emergence threshold
+    - If yes: you MUST be above that size (no interpolation)
+    - If no: smaller model may be cost-effective with fine-tuning
+```
+
+---
+
+## 4. Debate: Are Emergent Abilities Real?
+
+### 4.1 The Schaeffer et al. Critique
+
+```
+ARGUMENT AGAINST EMERGENCE (2023 paper):
+
+  1. Re-evaluated all BIG-Bench "emergent" tasks
+  2. Used linear and smooth metrics instead of exact-match
+  3. Found: almost ALL tasks show smooth improvement
+  4. Conclusion: "emergence is a mirage"
+
+COUNTER-ARGUMENTS:
+  1. Some tasks genuinely have no partial credit 
+     (e.g., correctly following a 5-step algorithm)
+  2. From a USER perspective, going from 5% → 95% IS emergence
+     (the model becomes USABLE at some threshold)
+  3. Even if improvement is "smooth", the PRACTICAL impact is nonlinear
+     (a 60% → 62% improvement is less meaningful than 10% → 50%)
+```
+
+### 4.2 Task Decomposition Argument
+
+```
+WHY EMERGENCE MAKES COMPUTATIONAL SENSE:
+
+  A Transformer with L layers and d dimensions has capacity to:
+    - Store O(L × d²) "facts" in weights
+    - Compose O(L) sequential operations
+    - Process O(d) "features" in parallel
+
+  For a task requiring K sequential reasoning steps:
+    Need: L ≥ K  (at minimum)
+    With noise and imperfect circuits: L ≈ 3K-5K in practice
+    
+  For 5-step reasoning: need ~15-25 layers minimum
+    GPT-2 (12 layers): below threshold → random on 5-step tasks
+    GPT-3 (96 layers): above threshold → capable of 5+ step reasoning
+```
+
+---
+
+## 5. Practical Implications
+
+### 5.1 When to Expect Emergence
+
+```
+RULE OF THUMB (from empirical observations):
+
+  Simple recall/classification: emerges early (~1B)
+  Pattern matching / ICL: ~10-30B  
+  Multi-step reasoning: ~50-100B
+  Complex mathematical proofs: ~100B+ (or not yet)
+  Novel scientific insight: not observed (even at largest scales)
+```
+
+### 5.2 Predicting Capabilities
+
+```
+CANNOT predict emergence from smaller models!
+  This is the key practical challenge:
+
+  You train a 7B model → it can't do task X.
+  Should you scale to 70B?
+  
+  ANSWER: you DON'T KNOW if 70B will work either.
+  The threshold could be at 13B, 70B, or 200B.
+  
+  SOLUTIONS:
+  1. Check if similar tasks have documented thresholds
+  2. Use loss as a PROXY (even if accuracy is flat, is loss decreasing?)
+  3. If loss is improving on the task's tokens → larger model WILL work eventually
+  4. Fine-tuning can shift the threshold DOWN by 3-5× (a fine-tuned 7B may
+     achieve what a base 30B does)
+```
+
+---
+
+## 6. Common Mistakes
+
+```
+❌ WRONG: Emergent abilities prove LLMs are developing consciousness/AGI
+✓ RIGHT:  Emergence just means "non-linear improvement with scale on specific
+          benchmarks". It's a statistical phenomenon, not evidence of
+          understanding or consciousness. The model still predicts next tokens.
+
+❌ WRONG: If a task is emergent at 60B, you need at least 60B params
+✓ RIGHT:  Fine-tuning, chain-of-thought prompting, and better training data
+          can shift the emergence threshold DOWN significantly.
+          A fine-tuned 7B can often match a base 60B on specific tasks.
+
+❌ WRONG: All improvements in LLMs are emergent (sudden jumps)
+✓ RIGHT:  Most improvements are SMOOTH with scale (following power laws).
+          Only a minority of tasks (those requiring simultaneous multi-skill
+          composition) show sharp transitions. Perplexity always improves smoothly.
+
+❌ WRONG: Once a capability emerges, it's always reliable
+✓ RIGHT:  At the emergence threshold, performance is ~50-70% (unreliable).
+          Reliable performance (>95%) requires significantly more scale
+          beyond the threshold. Emergence is the start, not the finish.
+```
+
+---
+
+## 7. Exercises
+
+1. **Product of Sigmoids**: If a task requires 4 independent sub-skills, each with pᵢ(N) = σ(5×(log₁₀N - 10)), compute P_task at N=1B, 10B, 30B, 100B. Plot or describe the shape. At what N does P_task first exceed 50%?
+
+2. **Metric Sensitivity**: A model gets 6-digit multiplication correct 0% of the time (exact match) but gets 4.5/6 digits correct on average. Compute the exact-match score and the "digit accuracy" score. How do these tell a different story about model capability?
+
+3. **Threshold Prediction**: Model A (7B) achieves 5% on task X. Model B (13B) achieves 8%. Model C (30B) achieves 45%. Estimate the emergence threshold. Would you recommend training a 70B model for this task?
+
+4. **Fine-tuning Shift**: A base model shows emergence at 60B. If fine-tuning typically shifts the threshold by 3-5×, what size fine-tuned model might match the 60B base? How many fine-tuning examples might be needed?

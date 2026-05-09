@@ -1,189 +1,330 @@
-# 01 — Token Embeddings
+# Understanding Token Embeddings
 
-## 1. Formal Definition
+*From integer token IDs to dense vectors — the mathematical foundation of neural text representation*
 
-A vocabulary V = {0, 1, …, |V|−1} maps each token to an integer ID.
+---
 
-The **embedding matrix** E ∈ ℝ^{|V| × d} assigns each token a real-valued vector:
+## Table of Contents
 
-```
-E = ┌ e₀ ─────────────────── ┐   ← row 0: embedding of token 0 ("the")
-    │ e₁ ─────────────────── │   ← row 1: embedding of token 1 ("a")
-    │ e₂ ─────────────────── │   ← row 2: embedding of token 2 ("cat")
-    │ ⋮                       │
-    └ e_{|V|-1} ────────────  ┘   ← row |V|-1: embedding of last token
+1. [Overview](#1-overview)
+   - [1.1 What Are Token Embeddings?](#11-what-are-token-embeddings)
+   - [1.2 Pipeline Position](#12-pipeline-position)
+2. [Formal Definition](#2-formal-definition)
+   - [2.1 The Embedding Matrix](#21-the-embedding-matrix)
+   - [2.2 Lookup as Matrix Multiplication](#22-lookup-as-matrix-multiplication)
+   - [2.3 Variables Table](#23-variables-table)
+3. [Geometric Interpretation](#3-geometric-interpretation)
+   - [3.1 Semantic Similarity](#31-semantic-similarity)
+   - [3.2 Cosine Distance Meaning](#32-cosine-distance-meaning)
+4. [Initialisation](#4-initialisation)
+   - [4.1 Why Random Initialisation Matters](#41-why-random-initialisation-matters)
+   - [4.2 Xavier/He Initialisation for Embeddings](#42-xavierhe-initialisation-for-embeddings)
+5. [Weight Tying (Shared Embeddings)](#5-weight-tying-shared-embeddings)
+   - [5.1 The Parameter Saving](#51-the-parameter-saving)
+   - [5.2 Mathematical Justification](#52-mathematical-justification)
+6. [Numerical Example](#6-numerical-example)
+7. [Common Mistakes](#7-common-mistakes)
+8. [Exercises](#8-exercises)
 
-Each row eₜ ∈ ℝ^d is a d-dimensional real vector.
+---
 
-LOOKUP (forward pass):
-  Input:  token_id  t  (a scalar integer)
-  Output: x_t = E[t, :]   ∈ ℝ^d
+## 1. Overview
 
-  This is equivalent to a one-hot multiply:
-    one_hot_t ∈ {0,1}^{|V|}  (1 at position t, 0 elsewhere)
-    x_t = one_hot_t · E  =  E[t, :]
-  but implemented as a direct index (O(1) lookup, not O(|V|·d) multiply).
-```
-
-## 2. Geometric Interpretation
-
-```
-Embedding space ℝ^d (shown in 3D for illustration):
-
-         "king"  •
-                   \
-        "queen" •   \  direction of "royalty"
-                     \
-         "man"  •    •  "woman"
-                    ↗
-                  direction of "gender"
-
-Key properties learned from data:
-  ‖E["king"] − E["man"] − E["woman"] + E["queen"]‖ ≈ 0
-  (famous word2vec analogy: king − man + woman ≈ queen)
-
-  Cosine similarity:
-  cos(eᵢ, eⱼ) = (eᵢ · eⱼ) / (‖eᵢ‖ · ‖eⱼ‖) ∈ [−1, 1]
-  
-  cos("cat", "kitten") ≈ 0.85  (similar meaning)
-  cos("cat", "democracy") ≈ 0.02 (unrelated)
-
-  Visual (2D projection of d=4096 embedding space):
-  ┌────────────────────────────────────────────────────┐
-  │                    · car                            │
-  │         · truck               · bus                │
-  │    · vehicle                                        │
-  │                          · plane  · jet            │
-  │  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄     │
-  │              · cat · dog · animal                  │
-  │         · "the" · "a" · "an"   (function words)    │
-  └────────────────────────────────────────────────────┘
-  (Clusters form naturally: vehicles, animals, determiners)
-```
-
-## 3. Weight Tying — Full Mathematical Derivation
+### 1.1 What Are Token Embeddings?
 
 ```
-STANDARD (no tying): two separate matrices
-  E_in  ∈ ℝ^{|V| × d}     (input embedding)
-  E_out ∈ ℝ^{d × |V|}     (output projection / unembedding)
-  
-  Forward pass:
-    x_t = E_in[t, :]                            ← embed
-    h   = TransformerLayers(x_1, …, x_t)        ← process
-    logits = h · E_out  ∈ ℝ^{|V|}              ← predict next token
-    P(next = k) = softmax(logits)_k
-  
-  Parameters: 2 × |V| × d
-
-WEIGHT TYING: E_out = E_inᵀ
-  logits_k = h · E_in[k, :] = hᵀ · e_k
-  
-  Geometric meaning:
-  logit_k = inner product between the hidden state h and token k's embedding e_k
-  
-  The model scores "how similar is my current hidden state to each token's embedding?"
-  This is conceptually correct: the model produces a hidden state "pointing toward" the
-  likely next token in embedding space.
-
-  PROOF that tying doesn't hurt expressiveness:
-    If we set E_out = E_in^T, the model can still:
-    - Learn arbitrary output distributions via the hidden state h
-    - The final LayerNorm before lm_head can re-scale h independently
-    - In practice, quality is equal or better (Press & Wolf 2017)
-  
-  PARAMETERS SAVED:
-  Without tying: |V| × d  +  |V| × d  = 2|V|d  = 2 × 128K × 4096 = 1.07B
-  With tying:    |V| × d               =  |V|d  = 524M
-  SAVED:         524M params  (6.5% of the 8B total)
+┌─────────────────────────────────────────────────────────────┐
+│  INTUITION                                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Token ID = 42 means nothing geometrically.                 │
+│  Token ID = 43 is not "similar" to 42.                      │
+│                                                             │
+│  Embedding = learned vector that ENCODES MEANING.           │
+│  embed("cat") ≈ embed("kitten")  (similar meaning → close) │
+│  embed("cat") ≠ embed("bicycle")  (different → far apart)  │
+│                                                             │
+│  ┌─────────────┐        ┌────────────────────────────┐      │
+│  │ token_id=42 │──────► │ [0.12, -0.34, 0.89, ...]  │      │
+│  │ (integer)   │ lookup │ d-dimensional real vector  │      │
+│  └─────────────┘        └────────────────────────────┘      │
+│                                                             │
+│  The entire embedding matrix is LEARNED during training.    │
+│  There is no formula — it's pure gradient descent.          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## 4. Embedding Scale — Why √d?
+> **Real-World Analogy**: Token IDs are like house addresses (arbitrary numbers). Embeddings are like GPS coordinates — they place each "house" (word) in a continuous space where nearby points are semantically related.
+
+### 1.2 Pipeline Position
 
 ```
-PROBLEM: After RoPE and positional encoding, we ADD two vectors:
-  z_t = x_t + PE(t)     (original Transformer)
-
-For this addition to be meaningful, both terms should have similar magnitude.
-
-SINUSOIDAL PE has entries bounded in [−1, 1]:
-  ‖PE(t)‖ = √(d/2)   (each sin/cos entry has magnitude ≤ 1, d/2 pairs)
-            = √(d/2) ≈ √(d) in order of magnitude
-
-EMBEDDING (standard init with std=1/√d):
-  E[t] ~ N(0, 1/d)   → ‖E[t]‖ ≈ √( d × 1/d ) = 1
-
-WITHOUT scaling:  ‖x_t‖ ≈ 1  vs  ‖PE(t)‖ ≈ √d
-  → Positional encoding DOMINATES at large d → token identity lost!
-
-WITH scaling by √d:  x_t = E[t] × √d → ‖x_t‖ ≈ √d
-  → Both terms have magnitude ≈ √d → balanced addition ✓
-
-Example for d = 512:
-  ‖E[t]‖ ≈ 1   without scaling
-  ‖PE(t)‖ ≈ 16  (very large relative to embedding!)
-  After scaling: ‖x_t‖ ≈ 16  ← matched
-```
-
-## 5. Initialisation — Mathematical Justification
-
-```
-GOAL: At initialisation, the embedding layer output should have unit variance.
-
-For E[t] ~ N(0, σ²) (each element independently):
-  x_t,i = E[t, i]  has variance σ²
-
-  ‖x_t‖² = ∑_{i=1}^{d} x_t,i²  has expectation d × σ²
-  
-  ‖x_t‖  ≈  σ√d   (by concentration of measure / law of large numbers)
-
-TYPICAL CHOICES:
-  σ = 1/√d  → ‖x_t‖ ≈ 1      (unit-norm embeddings at init)
-  σ = 0.02  → ‖x_t‖ ≈ 0.02√d  (LLaMA-3: fixed small std)
-
-Why LLaMA uses σ = 0.02:
-  ‖x_t‖ ≈ 0.02 × √4096 = 0.02 × 64 = 1.28
-  Combined with RMSNorm (normalises to unit RMS), the exact init matters less.
-
-GRADIENT FLOW at INIT (important for learning rare tokens):
-  Token t appears N_t times in training data.
-  Gradient per step: ∂L/∂E[t] = (1/N_t) × (attention-weighted feedback)
-  
-  For rare tokens (N_t = 100 in 1T corpus):
-  Effective updates per epoch:  ~100   (very sparse learning signal)
-  
-  Large embedding tables need careful LR tuning or separate LR for embedding vs rest.
-```
-
-## 6. Parameter Count and Memory
-
-```
-EMBEDDING TABLE:
-  |V| × d × bytes_per_element
-
-  LLaMA-3 8B:
-    |V| = 128,000   d = 4,096   BF16 = 2 bytes
-    = 128,000 × 4,096 × 2 = 1,048,576,000 bytes ≈ 1.05 GB
-
-  LLaMA-3 8B total params ≈ 8B × 2 bytes = 16 GB
-  Embedding fraction: 1.05 / 16 = 6.6%
-
-COMPARISON ACROSS MODELS:
-  Model          |V|      d      Emb params   % of total
-  ──────────────────────────────────────────────────────
-  GPT-2          50,257  1,024    51M          8.5%
-  LLaMA-2 7B     32,000  4,096   131M          1.9%
-  LLaMA-3 8B    128,000  4,096   524M          6.5%
-  GPT-4 (est.)  100,000  ~12,288 1.2B          ~1%
-
-  LLaMA-3 doubled the vocab size (32K → 128K) for better multilingual coverage.
-  Cost: 393M extra embedding params (manageable vs 8B total).
+Raw text: "The cat sat"
+    ↓ Tokenizer
+Token IDs: [464, 2368, 3332]
+    ↓ EMBEDDING LAYER ← THIS TOPIC
+Dense vectors: [[0.12,-0.34,...], [0.56,0.78,...], [0.23,-0.11,...]]
+    ↓ (+ Position Encoding)
+    ↓ Transformer layers
+Logits → next token prediction
 ```
 
 ---
 
-## Exercises
+## 2. Formal Definition
 
-1. For |V|=32000 and d=4096, compute the size of the embedding table in MB (float32 = 4 bytes).
-2. Derive why weight tying (E_out = E_in^T) is geometrically sensible by interpreting the logit computation as cosine similarity (up to normalisation).
-3. If you set d=64 for |V|=50000, compute how many tokens would need to be approximately orthogonal. Since ℝ^64 only has 64 truly orthogonal directions, what does this imply about the representation capacity?
+### 2.1 The Embedding Matrix
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  EMBEDDING MATRIX E ∈ ℝ^{|V| × d}                           │
+│                                                              │
+│  |V| = vocabulary size (e.g., 128,256 for LLaMA-3)          │
+│  d   = embedding dimension (e.g., 4096 for LLaMA-3 8B)      │
+│                                                              │
+│  E = ┌ e₀ ─────────────────── ┐  ← row 0: embed("the")     │
+│      │ e₁ ─────────────────── │  ← row 1: embed("a")       │
+│      │ e₂ ─────────────────── │  ← row 2: embed("cat")     │
+│      │ ⋮                       │                             │
+│      └ e_{|V|-1} ────────────  ┘  ← row |V|-1: last token   │
+│                                                              │
+│  Each row eₜ ∈ ℝᵈ is a d-dimensional learned vector.        │
+│                                                              │
+│  PARAMETER COUNT:                                            │
+│    |V| × d = 128,256 × 4,096 = 525 million parameters!     │
+│    ≈ 6.5% of total LLaMA-3 8B parameters                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Lookup as Matrix Multiplication
+
+```
+FORWARD PASS (lookup):
+  Input:  token ID t ∈ {0, 1, ..., |V|-1}
+  Output: x_t = E[t, :] ∈ ℝᵈ
+
+EQUIVALENT to one-hot multiplication:
+  one_hot(t) ∈ {0,1}^{|V|}  (1 at position t, 0 elsewhere)
+  x_t = one_hot(t)ᵀ × E = E[t, :]
+
+  But IMPLEMENTED as direct index lookup → O(d) not O(|V|×d)
+
+BACKWARD PASS (gradient):
+  ∂L/∂E[t, :] = ∂L/∂x_t   (gradient only updates row t)
+  ∂L/∂E[j, :] = 0  for j ≠ t  (other rows untouched)
+
+  → SPARSE gradient: only embeddings of tokens IN THE BATCH get updated.
+  → Rare tokens learn slowly (few gradient updates per epoch).
+```
+
+### 2.3 Variables Table
+
+| Symbol | Meaning | LLaMA-3 8B value |
+|--------|---------|-----------------|
+| E | Embedding matrix | ℝ^{128256 × 4096} |
+| \|V\| | Vocabulary size | 128,256 |
+| d | Embedding dimension | 4,096 |
+| e_t | Embedding vector for token t | ℝ^{4096} |
+| one_hot(t) | One-hot vector for token t | ℝ^{128256} |
+
+---
+
+## 3. Geometric Interpretation
+
+### 3.1 Semantic Similarity
+
+```
+AFTER TRAINING, embeddings cluster by meaning:
+
+  2D projection (PCA) of embedding space:
+  
+       "queen" ●
+                    "king" ●
+  "woman" ●                    ← royalty cluster
+                    "man" ●
+  
+  
+              "car" ●
+  "bicycle" ●          "truck" ●    ← vehicle cluster
+  
+  
+  FAMOUS RELATIONSHIP (Word2Vec, also emerges in LLMs):
+    embed("king") - embed("man") + embed("woman") ≈ embed("queen")
+    
+    The vector difference encodes the CONCEPT "royalty" independent of gender.
+```
+
+### 3.2 Cosine Distance Meaning
+
+```
+COSINE SIMILARITY between embeddings:
+  cos(eᵢ, eⱼ) = eᵢ · eⱼ / (‖eᵢ‖ × ‖eⱼ‖)
+
+  cos ≈ 1:   tokens are semantically similar ("cat" ↔ "kitten")
+  cos ≈ 0:   tokens are unrelated ("cat" ↔ "finance")
+  cos ≈ -1:  tokens are semantic opposites ("hot" ↔ "cold")
+
+IN PRACTICE (after training):
+  cos("dog", "puppy") ≈ 0.85
+  cos("dog", "canine") ≈ 0.78
+  cos("dog", "table") ≈ 0.05
+  cos("good", "bad") ≈ -0.15  (opposite but same domain)
+```
+
+---
+
+## 4. Initialisation
+
+### 4.1 Why Random Initialisation Matters
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  IF ALL EMBEDDINGS INITIALIZED TO SAME VECTOR:              │
+│    All tokens produce identical hidden states!              │
+│    Gradients are identical → symmetry never breaks!         │
+│    Model CANNOT learn to distinguish tokens.               │
+│                                                             │
+│  IF INITIALIZED WITH TOO LARGE VALUES:                      │
+│    Hidden states have large magnitude at start.             │
+│    Softmax saturates → gradient vanishes.                   │
+│    Training diverges or converges very slowly.              │
+│                                                             │
+│  IF INITIALIZED WITH TOO SMALL VALUES:                      │
+│    Hidden states ≈ 0 → all information lost.                │
+│    Gradients are tiny → training is extremely slow.         │
+│                                                             │
+│  GOLDILOCKS: small random values with controlled variance.  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Xavier/He Initialisation for Embeddings
+
+```
+STANDARD INITIALISATION:
+  E[t, :] ~ N(0, σ²)    where σ = 1/√d
+
+  For LLaMA-3 8B (d=4096):
+    σ = 1/√4096 = 1/64 = 0.0156
+    Each embedding element ∈ [-0.05, 0.05] (roughly, within 3σ)
+
+WHY 1/√d?
+  If x = E[t, :] has entries ~ N(0, σ²):
+    ‖x‖² = Σᵢ xᵢ² ≈ d × σ²   (by LLN)
+    
+  We want ‖x‖ ≈ 1 (unit-scale hidden states):
+    d × σ² = 1  →  σ = 1/√d  ✓
+
+  Alternative: uniform U(-a, a) where a = √(3/d)
+    Var[U(-a,a)] = a²/3 = 1/d  → same variance. ✓
+```
+
+---
+
+## 5. Weight Tying (Shared Embeddings)
+
+### 5.1 The Parameter Saving
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  WITHOUT WEIGHT TYING:                                      │
+│    Input embedding:  E_in ∈ ℝ^{|V| × d}   (525M params)   │
+│    Output head:      W_out ∈ ℝ^{d × |V|}  (525M params)    │
+│    Total:            1050M params just for embed+head!      │
+│                                                             │
+│  WITH WEIGHT TYING (LLaMA-3 uses this):                     │
+│    E_in = W_outᵀ    (shared matrix!)                        │
+│    Total:            525M params (50% savings!)             │
+│                                                             │
+│  For LLaMA-3 8B: saves 525M / 8030M = 6.5% of parameters  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Mathematical Justification
+
+```
+OUTPUT LOGIT for token v:
+  logit_v = hidden_state · w_out_v
+
+WITH WEIGHT TYING:
+  logit_v = hidden_state · e_v   (dot product with input embedding)
+
+INTUITION:
+  "The probability of outputting token v is proportional to how similar 
+   the final hidden state is to the EMBEDDING of token v."
+
+  P(next = v | context) ∝ exp(h · e_v)
+  
+  This makes sense: if the model's internal representation is "cat-like",
+  it should output tokens whose embeddings are similar to that state.
+
+GRADIENT BENEFIT:
+  With tying: embedding gets gradient from BOTH:
+    1. Forward pass (as input embedding)
+    2. Loss computation (as output classifier)
+  → Rare tokens learn faster (get gradient even when not in input).
+```
+
+---
+
+## 6. Numerical Example
+
+```
+EXAMPLE: LLaMA-3 8B, token "hello" has ID=9707
+
+  Embedding lookup:
+    x = E[9707, :]  ∈ ℝ^{4096}
+    x = [0.0123, -0.0089, 0.0234, -0.0156, ..., 0.0067]  (4096 values)
+  
+  Norm: ‖x‖ = √(Σᵢ xᵢ²) ≈ 1.0 (after training)
+  
+  Memory for one embedding: 4096 × 2 bytes (BF16) = 8 KB
+  Memory for full E matrix: 128,256 × 4096 × 2 = 1.0 GB (BF16)
+  
+  For a batch of tokens [9707, 278, 526]:
+    X = E[[9707, 278, 526], :]  ∈ ℝ^{3 × 4096}
+    (parallel lookup of 3 embeddings)
+
+COMPUTATION COST:
+  Forward: O(batch_size × seq_len × d) = essentially free (just memory access)
+  Backward: sparse update to only seen token rows
+  
+  Embedding lookup is NEVER the bottleneck — attention/FFN dominate FLOPs.
+```
+
+---
+
+## 7. Common Mistakes
+
+```
+❌ WRONG: Embeddings are fixed mathematical functions (like sin/cos PE)
+✓ RIGHT:  Token embeddings are 100% LEARNED from data. They start random
+          and gradually organise into semantic clusters through gradient descent.
+          Only position encodings can be fixed (sinusoidal) or learned.
+
+❌ WRONG: Token ID proximity means semantic proximity
+✓ RIGHT:  Token IDs are ARBITRARY integers assigned by the tokenizer.
+          Token 42 and 43 have NO inherent similarity.
+          Only the LEARNED embedding vectors encode semantic relationships.
+
+❌ WRONG: Each word gets one embedding
+✓ RIGHT:  Each TOKEN (subword unit) gets one embedding.
+          "unhappiness" might be ["un", "happiness"] → 2 embeddings looked up.
+          The word-level meaning emerges from context processing in later layers.
+
+❌ WRONG: The embedding matrix is the most computationally expensive part
+✓ RIGHT:  The embedding lookup is O(n×d) — essentially free.
+          Attention is O(n²×d) and FFN is O(n×d×4d) — much more expensive.
+          But the embedding matrix is large in PARAMETERS (6.5% of total).
+```
+
+---
+
+## 8. Exercises
+
+1. **Parameter Count**: For a model with |V|=50,257 (GPT-2) and d=768: compute the embedding matrix size in parameters and in MB (FP32). What fraction of GPT-2's 124M total parameters is this?
+
+2. **Initialisation Variance**: With σ=1/√d and d=4096, what is the expected L2 norm of a randomly initialised embedding vector? What if you accidentally use σ=1 instead?
+
+3. **Weight Tying Savings**: Model has |V|=128,256 and d=4096. Compare total parameter count with and without weight tying for the embedding + output head. Express savings as percentage of an 8B model.
+
+4. **Sparse Gradients**: In a batch of 2048 tokens from a 128K vocabulary, what fraction of embedding rows receive a gradient update? If you train for 1M steps with batch=2048, how many gradient updates does a token appearing with frequency 0.001% receive?

@@ -1,191 +1,311 @@
-# 04 — Speculative Decoding
+# Speculative Decoding for Autoregressive LLMs
 
-## 1. The Latency Problem — Why Decoding is Slow
+Accelerate **exact** decoding from a **target** distribution \(P_{\mathrm{target}}\) using a **cheap draft** model \(P_{\mathrm{draft}}\). Core idea: propose **\(K\)** candidate suffix tokens per round, then **verify** with **parallel forward passes** on the target. Covers **rejection sampling correction**, **proof of exactness**, **expected speedup**, and failure modes.
 
-```
-AUTOREGRESSIVE GENERATION CONSTRAINT:
-  Token t can only be generated AFTER tokens 1, ..., t-1 are known.
-  
-  → Sequential dependency: cannot parallelise across token positions!
-  
-  LATENCY = T × (time per step)
-  
-  Time per step for LLaMA-3 8B at batch=1:
-    KV cache read:   128 KB × context / (2 TB/s bandwidth) ≈ 0.26 ms (ctx=2048)
-    Compute:         2 × 8B × 1 = 16 GFLOPs / (312 TFLOPS) ≈ 0.05 ms
-    Total: ~0.3 ms per token  →  about 50 tokens/second
+---
 
-    For T=500 tokens: latency ≈ 10 seconds  (frustratingly slow for interactive use)
+## Table of Contents
 
-HARDWARE BOUND ANALYSIS:
-  At batch=1, compute intensity = 2×8B FLOPs / (2 × 8B × 2 bytes for weight read)
-                                 = 1 FLOP/byte  ← MUCH less than A100's 312/2000 = 156 FLOP/byte
-  
-  → The GPU is ~99% idle (waiting for memory, not computing)!
-  → Speculative decoding exploits this idle compute capacity.
-```
+- [1. Variables](#1-variables)
+- [2. Intuition — Amortize Target Forward Passes](#2-intuition--amortize-target-forward-passes)
+- [3. Setup: Draft vs Target](#3-setup-draft-vs-target)
+- [4. One-Round Algorithm (Draft then Verify)](#4-one-round-algorithm-draft-then-verify)
+- [5. Acceptance Rule and Rejection Sampling](#5-acceptance-rule-and-rejection-sampling)
+- [6. Proof Sketch: Output Distribution Matches Target](#6-proof-sketch-output-distribution-matches-target)
+  - [6.1 Correctness via composition (finite vocabulary)](#61-correctness-via-composition-finite-vocabulary)
+- [7. Expected Speedup Formula](#7-expected-speedup-formula)
+  - [7.1 Geometric model for consecutive accepts (toy)](#71-geometric-model-for-consecutive-accepts-toy)
+- [8. Parallel Verification — One Forward for Many Positions](#8-parallel-verification--one-forward-for-many-positions)
+- [9. Pseudocode (Full Round)](#9-pseudocode-full-round)
+- [10. Numerical Examples](#10-numerical-examples)
+- [11. Common Mistakes](#11-common-mistakes)
+- [12. Exercises](#12-exercises)
 
-## 2. Speculative Decoding — Exact Algorithm
+---
 
-```
-SETUP:
-  π_p = target model (large, expensive, LLaMA-3 70B)  p = "primary"
-  π_q = draft model  (small, cheap,    LLaMA-3 8B)   q = "quick"
-  γ = number of speculative tokens per step
+## 1. Variables
 
-ALGORITHM (one speculative step):
+| Symbol | Meaning |
+|--------|---------|
+| \(P_{\mathrm{target}}\) | Large **oracle** model distribution at each position |
+| \(P_{\mathrm{draft}}\) | Small draft model providing fast proposals |
+| \(K\) | Number of speculative candidate tokens per round (aka \(\gamma\) in some papers) |
+| \(x_{:t}\) | Context prefix accepted up to time \(t\) |
+| \(u\) | Proposed token at a verification substep |
+| \(a\) | Acceptance probability in rejection sampling step |
+| \(q\) | Draft probability at verification (**same distribution** used when sampling draft) |
+| \(p\) | Target probability (**ideal** distribution we want to sample exactly) |
+| \(S\) | Expected accepted tokens per target-heavy phase |
+| \(\mathrm{speedup}\) | Tokens per wall-clock vs baseline AR decoding |
 
-  DRAFT PHASE (serial, using π_q):
-    For l = 1 to γ:
-      x̃_{t+l} ~ π_q(· | x₁,...,x_{t+l-1})   ← sample from draft model
+---
 
-    Result: draft tokens x̃_{t+1}, ..., x̃_{t+γ}
-
-  VERIFICATION PHASE (parallel, using π_p):
-    Compute in ONE forward pass of π_p:
-      p_{t+1} = π_p(· | x₁,...,xₜ)
-      p_{t+2} = π_p(· | x₁,...,xₜ, x̃_{t+1})
-      ...
-      p_{t+γ} = π_p(· | x₁,...,xₜ, x̃_{t+1}, ..., x̃_{t+γ-1})
-    
-    This is ONE forward pass through π_p with γ tokens!
-    All γ probabilities computed simultaneously (batch of 1 with multiple queries).
-
-  REJECTION SAMPLING (accept/reject each draft token):
-    For l = 1 to γ:
-      Let q = π_q(x̃_{t+l} | context)   (draft probability of this token)
-      Let p = π_p(x̃_{t+l} | context)   (target probability of this token)
-      
-      Accept x̃_{t+l} with probability min(1, p/q)
-      If rejected: sample new token from adjusted distribution
-                   p'(x) = norm(max(0, p(x) − q(x)))   ("correction distribution")
-                   x_{t+l} ~ p'
-                   STOP (don't accept any more draft tokens in this step)
-
-  OUTPUT: all accepted tokens (and one corrected token if any rejection)
-```
-
-## 3. Correctness Proof — Distribution Matching
+## 2. Intuition — Amortize Target Forward Passes
 
 ```
-THEOREM: Speculative decoding produces samples IDENTICAL in distribution to the target π_p.
+Standard AR (target only):
+   t ──► t+1 ──► t+2 ──► ...     one BIG forward each step (serial)
 
-PROOF for a single position (simplify to one draft token):
-  x̃ ~ q(x) (draft distribution)
-  Accept with probability α = min(1, p(x̃)/q(x̃))
-
-CASE 1: p(x) ≥ q(x) for a particular x:
-  P(x is accepted) = q(x) × min(1, p(x)/q(x)) = q(x) × 1 = q(x)  [since p≥q, accept always]
-
-CASE 2: p(x) < q(x):
-  P(x is accepted) = q(x) × min(1, p(x)/q(x)) = q(x) × p(x)/q(x) = p(x)
-
-Wait, let's redo: we need the OUTPUT distribution = p(x).
-  
-P(output = x):
-  = P(x is accepted from draft)  +  P(some rejection AND then x is sampled from p')
-  = q(x) × min(1, p(x)/q(x))    +  P(rejection occurs) × p'(x)
-  
-Let Z = ∑_x max(0, p(x)−q(x))  (normalisation constant of p')
-P(rejection) = ∑_x q(x) × max(0, 1 − p(x)/q(x)) = ∑_x max(0, q(x)−p(x)) = 1 − ∑_x min(p(x),q(x))
-
-P(output = x) = min(p(x), q(x)) + [1 − ∑_y min(p(y),q(y))] × max(0, p(x)−q(x)) / Z
-
-Let T = ∑_y min(p(y),q(y)).  Then Z = ∑_y max(0, p(y)−q(y)) = 1−T (since ∑p=∑q=1 implies ∑max(0,p-q) = 1−T).
-
-P(output = x) = min(p(x),q(x)) + (1−T) × max(0,p(x)−q(x))/(1−T)
-              = min(p(x),q(x)) + max(0, p(x)−q(x))
-              = p(x)   [since min(a,b)+max(0,a−b) = a for all a,b] ■
-
-Output distribution = p(x) = target distribution  ✓
-Speculative decoding is EXACTLY correct, not approximate!
+Speculative (draft + target):
+   draft: small model proposes  u1, u2, ..., uK   (cheap serial)
+   target: ONE forward evaluates logits at stacked positions in parallel
+           verify / accept prefix of {u1,...,uK}
 ```
 
-## 4. Expected Speedup — Mathematical Derivation
+**Key:** GPUs often underutilized at small batch—**batched** target evaluation across positions can multiply throughput if **acceptance** rate is decent.
+
+---
+
+## 3. Setup: Draft vs Target
+
+Let the **desired sampling law** be **exactly** the target model:
+
+\[
+\text{Want } y_{t+1:t+K} \sim \prod_{i=1}^{K} P_{\mathrm{target}}(\,\cdot \mid x, y_{:t+i-1}).
+\]
+
+The draft proposes **likely** continuations **under its own** dynamics:
+
+\[
+\tilde{y}_{t+i} \sim P_{\mathrm{draft}}(\,\cdot \mid x,\tilde{y}_{:t+i-1}).
+\]
+
+Verification compares **draft vs target** probabilities to perform a statistically correct **accept/reject** or **max coupling** style step—implementation variants exist, but the **mathematical contract** is **restore exactness**.
+
+---
+
+## 4. One-Round Algorithm (Draft then Verify)
+
+For each speculative round:
+
+1. **Draft:** autoregressively sample \(K\) tokens \(\tilde{y}_{t+1:t+K}\) from \(P_{\mathrm{draft}}\) conditioned on accepted prefix.
+
+2. **Verify:** using **target** model, obtain conditional probabilities \(p_i(v)=P_{\mathrm{target}}(v\mid \text{prefix})\) for positions \(i=1..K\) in **one** parallel forward (causal masking).
+
+3. **Sequential accept test** along \(i=1..K\):
+
+   - Compare \(p_i(\tilde{y}_{t+i})\) and \(q_i(\tilde{y}_{t+i})\) where \(q_i\) is **draft's** probability for the **same** token at that prefix when draft produced it.
+
+   - Accept token \(i\) with probability min\(\bigl(1,\frac{p_i(\tilde{y}_{t+i})}{q_i(\tilde{y}_{t+i})}\bigr)\) **(Metropolis-style acceptance / rejection sampling ratio bound)**; exact details align with the chosen speculative algorithm family (Leviathan / **speculative decoding** canonical formulation).
+
+4. On first rejection at position \(i\), **resample** a corrected token from the residual distribution so the **marginal** matches \(p_i(\cdot)\).
+
+---
+
+## 5. Acceptance Rule and Rejection Sampling
+
+**Rejection sampling background:** To sample from \(p\) but only know how to sample \(q\), draw \(y\sim q\) and accept with
+
+\[
+a(y) = \min\!\left(1, \frac{p(y)}{M\,q(y)}\right),
+\]
+
+where \(M\) covers \(p/q\) if bounded. In LLM stacks, ratios use **matching prefixes** and **same** token \(y\).
+
+**Per-step acceptance (canonical form used in speculative decoding writeups):**
+
+Define \(r_i = \dfrac{p_i(\tilde{y}_{t+i})}{q_i(\tilde{y}_{t+i})}\). Accept \(\tilde{y}_{t+i}\) w.p. \(\min(1,r_i)\).
+
+If rejected, sample replacement from distribution
+
+\[
+\frac{\max(0,\, p_i(v) - q_i(v))}{Z}
+\quad\text{(residual mass after draft overlap)},
+\]
+
+up to normalization constants encoded in official references—this **repairs** the coupling so marginals equal \(p_i\).
+
+---
+
+## 6. Proof Sketch: Output Distribution Matches Target
+
+**Invariant per position \(i\)** (conditioned on prior accepted prefix **exact** under target):
+
+- Draft proposes \(\tilde{y}\sim q_i\).
+- Accept–reject with \(\min(1,\frac{p_i(\tilde{y})}{q_i(\tilde{y})})\) yields **accepted** samples following \(p_i\) **(rejection sampling theorem)**.
+
+If rejected, **correction sampling** from normalized \(\max(0,p_i-q_i)\) (or equivalent **max coupling** sampling) ensures the **next accepted token** is exactly \(p_i\).
+
+By induction along time steps, the **stream of accepted tokens** is **identically distributed** to **naive autoregressive sampling** from \(P_{\mathrm{target}}\).
+
+### 6.1 Correctness via composition (finite vocabulary)
+
+Let \(p,q\) be distributions on finite \(V\). **Rejection sampling** draws \(Y\sim q\), accepts with probability \(r(Y)=\min\bigl(1,\frac{p(Y)}{M\,q(Y)}\bigr)\) for envelope \(M\ge \max_y \frac{p(y)}{q(y)}\) (with convention \(0/0=0\)). The probability of accepting **and** outputting \(y\) equals \(\min\bigl(q(y),\frac{p(y)}{M}\bigr)\). Conditioning on acceptance yields \(p\) **exactly** as the output law. Speculative decoding realises an analogous **per-position** contract with **shared prefixes**; the **algorithmic** nuance is bookkeeping \(q\) as the **draft’s** conditional for the **very** token proposed along a **single** trajectory.
+
+**ASCII coupling:**
 
 ```
-Let α = E[acceptance rate per token] = E[min(1, p(x)/q(x))]
-  where the expectation is over x ~ q(x).
-
-ACCEPTANCE RATE FORMULA:
-  α = ∑_x q(x) × min(1, p(x)/q(x)) = ∑_x min(p(x), q(x))
-    = 1 − (1/2) × TV(p, q)  × 2 = 1 − TV(p, q)
-    
-  where TV(p,q) = (1/2) ∑_x |p(x)−q(x)|  is the total variation distance.
-
-  α = 1 − TV(p,q) ∈ [0,1]
-  α ≈ 1 when p ≈ q (draft ≈ target)  → most tokens accepted!
-  α ≈ 0 when p ≠ q completely         → all rejected (no speedup)
-
-EXPECTED ACCEPTED TOKENS PER SPECULATIVE STEP:
-  E[accepted tokens] = ∑_{k=1}^{γ} P(first k tokens all accepted)
-  
-  Assuming i.i.d. acceptance (approximation): P(k accepted) = α^k
-  E[accepted] = ∑_{k=1}^{γ} α^k = α(1−α^γ)/(1−α)   (geometric series)
-  
-  Plus 1 extra token from correction sampling (always generated):
-  E[tokens per step] = 1 + α(1−α^γ)/(1−α)
-
-TIME PER SPECULATIVE STEP:
-  Drafting (γ serial steps of π_q):  γ × t_q
-  Verification (1 parallel step of π_p with γ+1 tokens): t_p × 1 (parallel!)
-  Total: γ × t_q + t_p
-
-WITHOUT SPECULATIVE DECODING:
-  To generate E[tokens per step] tokens using π_p alone:
-  Time = E[tokens per step] × t_p
-
-SPEEDUP:
-  S = E[tokens per step] × t_p / (γ × t_q + t_p)
-    = [1 + α(1−α^γ)/(1−α)] × t_p / (γ × t_q + t_p)
-
-EXAMPLE:
-  α = 0.75,  γ = 4,  t_q = 0.1 ms,  t_p = 1.0 ms (10× larger model)
-  
-  E[tokens/step] = 1 + 0.75(1−0.75⁴)/(1−0.75) = 1 + 0.75×0.684/0.25 = 1 + 2.05 = 3.05
-  
-  Time: 4×0.1 + 1.0 = 1.4 ms
-  vs naive: 3.05 × 1.0 = 3.05 ms
-  
-  Speedup = 3.05 / 1.4 = 2.2×
-  
-  Practical speedups: 2-3× for well-matched draft/target pairs.
-```
-
-## 5. Choosing the Draft Model
-
-```
-OPTIMAL DRAFT MODEL CRITERIA:
-  1. Fast: t_q << t_p  (draft should take <20% of target model time)
-  2. Accurate: TV(p, q) small → α high
-  3. Same vocabulary as target (required for token matching)
-
-PRACTICAL CHOICES:
-  Target: LLaMA-3 70B  → Draft: LLaMA-3 8B   (9× faster, same tokeniser)
-  Target: LLaMA-3 8B   → Draft: LLaMA-3 1B   (8× faster, same tokeniser)
-  Target: Claude-3 Opus → Draft: Claude-3 Haiku (10× faster, same tokeniser)
-
-SELF-SPECULATIVE DECODING (single model):
-  Use early exit at intermediate layers as the "draft":
-    Draft: stop at layer L/2, project to vocabulary → approximate logits
-    Verify: full forward pass, check if early-exit prediction matches full-pass
-  
-  No separate draft model needed! Same KV cache reused.
-  
-  ACCEPTANCE RATE ANALYSIS:
-    For each layer l (out of L total):
-    α_l ≈ exp(−ε_l)  where ε_l = KL(π_full ‖ π_layer_l)
-    
-    Layers near the end (l close to L): ε_l ≈ 0 → α_l ≈ 1 (almost always agree)
-    Earlier layers: ε_l > 0 → lower acceptance rate
-    
-    Empirically: using 50% of layers as draft gives α ≈ 0.6-0.8 on many tasks.
+     q  proposes ──► compare p vs q on SAME token
+                         │
+                         ├── accept path  (exact p marginal)
+                         │
+                         └── reject path  (correction draw)  (exact p marginal)
 ```
 
 ---
 
-## Exercises
+## 7. Expected Speedup Formula
 
-1. Prove algebraically that min(p(x),q(x)) + max(0, p(x)−q(x)) = p(x) for all p(x),q(x)≥0. This is the key identity in the correctness proof.
-2. For α=0.8 and γ=5, compute the expected number of accepted tokens per step. What is the speedup if t_q = 0.05ms and t_p = 0.5ms?
-3. Show that when p=q (draft perfectly matches target), α=1 and all γ draft tokens are always accepted. What does the speedup formula reduce to in this case?
+Let:
+
+- \(c_{\mathrm{draft}}\) = time for draft to produce \(K\) tokens,
+- \(c_{\mathrm{verify}}\) = time for one **batched** target forward across up to \(K\) positions.
+
+**Ballpark per-new-token wall-clock under ideal parallelism:**
+
+Let \(\mathbb{E}[S]\) be expected **accepted tokens per round**.
+
+**Speedup vs baseline** target-only per token \(\approx\)
+
+\[
+\frac{c_{\mathrm{target\_step}}}{\dfrac{c_{\mathrm{draft}} + c_{\mathrm{verify}}}{\mathbb{E}[S]}}.
+\]
+
+Useful **intuition:** If one verification can validate **many** draft tokens (\(S\) near \(K\)), amortized target cost drops nearly **\(K\times\)** per accepted token—if draft is **cheap** and alignment is **high**.
+
+A common textbook-style factorization:
+
+\[
+\mathrm{Speedup} \approx
+\frac{1}{
+\frac{c_{\mathrm{draft}}}{K\cdot c_{\mathrm{target\,ref}}}}
++ \frac{c_{\mathrm{verify}}}{K\cdot c_{\mathrm{target\,ref}}}
+}
+\cdot \mathbb{E}[S].
+\]
+
+(Exact constants depend on kernel batching, KV-cache sizes, \(K\), implementation.)
+
+**Acceptance probability:** Heuristically grows when **draft ≈ target** locally (student–teacher agreement) on high-confidence tokens.
+
+### 7.1 Geometric model for consecutive accepts (toy)
+
+Assume **independent** identical acceptance probability \(\alpha\in(0,1]\) across slots (approximation only). Let \(S\) be the number of accepted draft tokens before first rejection or horizon \(K\):
+
+\[
+\mathbb{P}(S=s)=\alpha^{s}(1-\alpha)\ (s<K),\qquad \mathbb{P}(S=K)=\alpha^{K}.
+\]
+
+Then
+
+\[
+\mathbb{E}[S]=(1-\alpha)\sum_{s=0}^{K-1} s\alpha^{s} + K\alpha^{K}.
+\]
+
+For \(\alpha\to 1\), \(\mathbb{E}[S]\to K\); for small \(\alpha\), increasing \(K\) yields **diminishing returns** because rounds terminate early—motivates **adaptive** \(K\).
+
+---
+
+## 8. Parallel Verification — One Forward for Many Positions
+
+Given accepted prefix \(x_{:t}\) and candidate extension \(\tilde{y}_{t+1:t+K}\), transformer with **causal attention** can compute **next-token distributions** for each prefix position needed in **one** forward on a window **if** logits for **each prefix state** are exposed via **offset** prefill techniques.
+
+**Complexity note:** You still pay \(\mathcal{O}((t+K)^2)\) attention in naive implementations—**KV caching** and careful scheduling make the dominant cost **near-linear** in practical lengths for moderate \(K\).
+
+---
+
+## 9. Pseudocode (Full Round)
+
+```
+function speculative_round(x_prefix, K):
+    # Draft phase (often on CPU / small GPU)
+    draft_tokens ← []
+    for i in 1..K:
+        u ~ P_draft(· | x_prefix ◦ draft_tokens)
+        append u to draft_tokens
+        store q[i] ← P_draft(u | appropriate prefix)
+
+    # Verify phase (large model, parallel logits for needed positions)
+    for i in 1..K:
+        p[i] ← P_target(· | x_prefix ◦ draft_tokens[1:i-1])  # parallel in optimized kernels
+
+    accepted ← 0
+    for i in 1..K:
+        r ← p[i](draft_tokens[i]) / q[i]        # guard numerical floors
+        if Bernoulli(min(1, r)):
+            accepted += 1
+            extend x_prefix with draft_tokens[i]
+        else:
+            y ← sample_correction_from_target_residual(p[i], q[i])
+            extend x_prefix with y
+            break   # end round early after resample
+
+    if accepted == K:
+        # optional extra sampling for next start; implementations vary
+        return x_prefix
+    return x_prefix
+```
+
+**Note:** Exact **break/continue** rules match the reference implementation you follow—**mathematics**: preserve per-position **exactness** after correction.
+
+---
+
+## 10. Numerical Examples
+
+### Example 1 — Acceptance ratio
+
+Suppose at some step, for proposed token \(u\),
+
+\[
+p(u)=0.12,\qquad q(u)=0.20.
+\]
+
+Acceptance probability \(= \min(1,\frac{0.12}{0.20}) = 0.6\).
+
+Interpretation: target finds the draft’s token **plausible but not** overly tilted vs draft—**40%** need **resample** from residual.
+
+### Example 2 — Perfect alignment
+
+If **everywhere** \(q=p\), acceptance is **1** and no corrections ⇒ maximal speedup (idealized **distillation match**).
+
+### Example 3 — Speedup back-of-envelope
+
+Suppose baseline target takes **10** ms/token. A round with \(K=4\) spends **2** ms draft + **12** ms batched target verify and accepts **3.2** tokens on average.
+
+**Amortized target-equivalent**\(\approx (2+12)/3.2=4.375\) ms/token **if** dominated by these phases \(\Rightarrow\) speedup \(\approx 10/4.375 \approx 2.3\times\).
+
+(Toy numbers only.)
+
+---
+
+## 11. Common Mistakes
+
+- ❌ **Assume speculative decoding changes \(P_{\mathrm{target}}\).**
+
+  ✓ Correct implementation samples **exactly** from target (up to floating error).
+
+- ❌ **Use mismatched \(q\) (different temperature than draft sampling).**
+
+  ✓ Store **the exact logprobs** used when sampling each proposal.
+
+- ❌ **Skip correction after rejection.**
+
+  ✓ Otherwise marginals deviate—**biased** outputs.
+
+- ❌ **Set \(K\) huge without measuring acceptance.**
+
+  ✓ High \(K\) may waste verify FLOPs if reject early—**adaptive \(K\)** exists.
+
+- ❌ **Ignore memory bandwidth** of big target forward at long contexts.
+
+  ✓ Speedups shrink when **memory-bound**.
+
+---
+
+## 12. Exercises
+
+1. **Prove** standard rejection sampling: accepted draws follow \(p\) when proposals come from \(q\) with acceptance \(\min(1, p/(Mq))\).
+
+2. Write the **total variation distance** bound between approximate speculative sampling without corrections vs true \(p\).
+
+3. If **\(p\le q\) pointwise** always, show acceptance is **always 1**. What does that imply about draft quality?
+
+4. **Derive** expectation of accepted length in **geometric** model when per-step accept prob constant \(=\alpha\).
+
+5. Explain why **speculative execution** on **CPU** branch predictors is **not** mathematically exact—what differs for LLMs?
+
+---
+
+### Coda
+
+Speculative decoding trades **algorithmic bookkeeping** for **GPU wavefront utilization**. Pair it with **draft model distillation** from target for maximal acceptance; measure **tokens/sec** and **exact-match distribution tests** vs brute-force AR on short sequences.

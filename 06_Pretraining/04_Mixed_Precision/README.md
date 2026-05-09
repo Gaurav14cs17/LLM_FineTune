@@ -1,173 +1,301 @@
-# 04 — Mixed Precision Training
+# Mixed Precision Training for LLMs
 
-## 1. Floating Point Number Systems — Full Analysis
+*BF16 vs FP16, master weights, loss scaling, memory copies, and FP8 precisions*
 
-```
-IEEE 754 floating point format:  sign | exponent | mantissa
-                                  1 bit   E bits     M bits
+---
 
-VALUE represented:  (−1)^sign × 2^{exponent−bias} × (1 + mantissa/2^M)
+## Table of Contents
 
-FORMATS USED IN LLM TRAINING:
-                 Sign  Exp  Mantissa  Total  Range          Precision
-  FP32 (full)     1     8     23       32    ±3.4×10³⁸      ~7 decimal digits
-  FP16 (half)     1     5     10       16    ±65504          ~3 decimal digits
-  BF16 (brain)    1     8      7       16    ±3.4×10³⁸      ~2 decimal digits
-  FP8 E4M3        1     4      3        8    ±448            ~1 decimal digit
-  FP8 E5M2        1     5      2        8    ±57344          ~0.5 decimal digit
+1. [Overview](#1-overview)
+2. [INTUITION: Bits Budget](#2-intuition-bits-budget)
+3. [VARIABLES](#3-variables)
+4. [IEEE-754 Style Layouts: FP32, BF16, FP16](#4-ieee-754-style-layouts-fp32-bf16-fp16)
+   - [INTUITION: Bit Packing](#41-intuition-bit-packing)
+5. [Why BF16’s Exponent Range Matters](#5-why-bf16s-exponent-range-matters)
+6. [Training Stack: FP32 Master + BF16 Compute](#6-training-stack-fp32-master--bf16-compute)
+7. [Loss Scaling for FP16 (Not BF16)](#7-loss-scaling-for-fp16-not-bf16)
+8. [The Three-Copy Memory Picture](#8-the-three-copy-memory-picture)
+9. [FP8: E4M3 and E5M2](#9-fp8-e4m3-and-e5m2)
+10. [Numerical Stability Analysis](#10-numerical-stability-analysis)
+11. [NUMERICAL EXAMPLES](#11-numerical-examples)
+12. [Pseudocode](#12-pseudocode)
+13. [COMMON MISTAKES](#13-common-mistakes)
+14. [EXERCISES](#14-exercises)
 
-KEY INSIGHT — BF16 vs FP16:
-  BF16 truncates MANTISSA (fewer significant digits)
-  FP16 truncates EXPONENT (smaller range)
-  
-  BF16 range = FP32 range (same exponent!) → no overflow on large activations
-  FP16 can overflow above 65504 — common during training!
-  
-  ┌─────────────────────────────────────────────────────────────┐
-  │  FP32: ██████████████████████████████████  (full precision) │
-  │  BF16: ████████████████                    (half precision) │
-  │         same exponent range ✓   fewer mantissa bits         │
-  │                                                             │
-  │  FP16: ████████████████                    (half precision) │
-  │         narrower range!      more mantissa bits             │
-  └─────────────────────────────────────────────────────────────┘
-```
+---
 
-## 2. Mixed Precision Training — Mathematical Framework
+## 1. Overview
 
-```
-MIXED PRECISION STRATEGY (Micikevicius et al. 2018):
-  
-  Store: master weights in FP32  (high precision for accumulation)
-  Compute: forward/backward in BF16 (fast, uses Tensor Cores)
-  
-  FORWARD PASS:
-    W_bf16 = cast(W_fp32, BF16)                ← on-the-fly, no storage
-    a_l = f_l(a_{l-1}, W_bf16)                 ← BF16 matmul
-    Store activations a_l in BF16 (gradient checkpointing: some in FP32)
-  
-  BACKWARD PASS:
-    Compute gradients g_bf16 in BF16
-    g_fp32 = cast(g_bf16, FP32)                ← upcast before accumulation
-  
-  OPTIMIZER STEP (all in FP32):
-    m_t = β₁ m_{t-1} + (1-β₁) g_fp32
-    v_t = β₂ v_{t-1} + (1-β₂) g_fp32²
-    W_fp32 -= η × m̂_t / (√v̂_t + ε)
+**Mixed precision** trains large models using **low-precision** (16-bit or 8-bit) **tensor arithmetic** for speed and memory, while keeping **high-precision** copies where **round-off** would break optimisation. BF16 is the **default** for many LLM pretrain runs on NVIDIA hardware; FP16 often needs **dynamic loss scaling**; **FP8** is emerging for next-gen kernels.
 
-WHY FP32 FOR OPTIMIZER STATES?
-  AdamW maintains per-parameter running statistics m, v.
-  These accumulate SMALL increments over many steps.
-  
-  BF16 mantissa precision: ~0.8% relative error (1/2^7 = 0.0078)
-  For a weight W = 0.1 and gradient update Δ = 0.0001:
-    In BF16: 0.1 + 0.0001 = 0.1001 rounds to 0.1   ← update LOST!
-    In FP32: 0.1 + 0.0001 = 0.1001                 ← preserved ✓
-  
-  Over 100K training steps, accumulated BF16 rounding errors destroy convergence.
-```
+This note tabulates **bit layouts**, compares **dynamic range** and **mantissa precision**, explains **master weights** + **Adam states**, sketches the **three memory copies**, introduces **FP8** variants, and analyses **underflow/overflow** failure modes.
 
-## 3. Loss Scaling — Why FP16 Needs It
+---
+
+## 2. INTUITION: Bits Budget
 
 ```
-FP16 UNDERFLOW PROBLEM:
-  FP16 smallest positive normal: ~6.1×10⁻⁵
-  FP16 smallest positive subnormal: ~5.96×10⁻⁸
-  
-  Gradient magnitudes in deep LLMs: often in range [10⁻⁷, 10⁻⁴]
-  → Many gradients UNDERFLOW to 0 in FP16!
-  
-  ┌─────────────────────────────────────────────────────────────┐
-  │  TRUE gradient distribution:                                │
-  │                    ██                                       │
-  │                  ██████                                     │
-  │                ██████████                                   │
-  │              ████████████████                               │
-  │  ──────────────────────────────────────────────────────    │
-  │  10⁻⁸  10⁻⁶  10⁻⁴  10⁻²   1                              │
-  │        ↑ FP16 underflow below ~6×10⁻⁵                      │
-  │        These gradients → 0 in FP16 → silent accuracy loss  │
-  └─────────────────────────────────────────────────────────────┘
-
-DYNAMIC LOSS SCALING solution:
-  1. Multiply loss by scale factor S (e.g., S=2048)
-     loss_scaled = S × loss
-  2. Backward pass computes S × gradients  (larger → no underflow!)
-  3. Divide by S before optimizer update:  g_true = g_scaled / S
-  4. Check for overflow (Inf/NaN in g_scaled):
-       If Inf/NaN found:
-         Discard the entire step (don't update weights)
-         S ← S / 2  (halve the scale)
-       Else (no overflow for K=2000 consecutive steps):
-         S ← S × 2  (double the scale)
-
-WHY BF16 DOESN'T NEED LOSS SCALING:
-  BF16 smallest normal: ~9.2×10⁻⁴¹  (same as FP32!)
-  → Gradients never underflow in BF16
-  → No loss scaling needed → simpler training code!
-```
-
-## 4. Memory Breakdown — Exact Calculations
-
-```
-For 8B parameter model (e.g. LLaMA-3 8B):
-
-INFERENCE (BF16):
-  Model weights:  8×10⁹ × 2 bytes = 16 GB
-  KV cache (varies with context, see Ch.8)
-
-TRAINING (BF16 forward/backward + FP32 optimizer):
-  Component                    Formula           Size
-  ─────────────────────────────────────────────────────
-  BF16 model weights           8B × 2B    =  16 GB
-  BF16 gradients               8B × 2B    =  16 GB
-  FP32 master weights          8B × 4B    =  32 GB  ← for update accumulation
-  FP32 Adam 1st moment m       8B × 4B    =  32 GB
-  FP32 Adam 2nd moment v       8B × 4B    =  32 GB
-  ─────────────────────────────────────────────────────
-  Parameters/gradients total              = 128 GB
-  Activations (batch=1, L=4096) ≈          30 GB  ← depends on seq length
-  ─────────────────────────────────────────────────────
-  TOTAL ≈ 158 GB  ← needs 2× A100 80GB at minimum!
-
-WITH GRADIENT CHECKPOINTING:
-  Store only activations at layer boundaries, recompute within each layer.
-  Activation memory: ~8 GB  (saving 22 GB)
-  Cost: +33% FLOPs (recompute forward for each layer during backward)
-
-8-BIT OPTIMIZER (bitsandbytes):
-  m, v stored in INT8 instead of FP32: 8B × 1B × 2 = 16 GB  (saves 48 GB!)
-  Total with INT8 optim + gradient checkpointing: ≈ 76 GB → fits on single A100!
-```
-
-## 5. Tensor Core Utilisation
-
-```
-NVIDIA Tensor Cores: hardware units that compute A×B+C in BF16/FP16 in one cycle.
-  Peak throughput on A100: 312 TFLOPS (BF16) vs 19.5 TFLOPS (FP32)
-  → BF16 is 16× faster for matmuls!
-
-BUT: only works on specific matrix dimensions (multiples of 8 or 16).
-
-ALIGNMENT REQUIREMENTS (for optimal Tensor Core use):
-  d, d_ff, |V| should all be multiples of 64 (ideally 128 or 256).
-  LLaMA-3 8B:
-    d = 4096 = 32 × 128 ✓
-    d_ff = 14336 = 112 × 128 ✓
-    |V| = 128000 = 1000 × 128 ✓
-
-EFFECTIVE FLOPS utilisation (MFU — Model FLOPs Utilisation):
-  MFU = (actual FLOPs/sec) / (peak Tensor Core FLOPs/sec)
-  
-  Typical LLM training MFU: 40–50% on A100
-  (rest lost to memory bandwidth, communication overhead, etc.)
-  FlashAttention improves MFU by ~10–15 percentage points.
+┌────────────────────────────────────────────────────────────────────┐
+│  Fixed 16 bits — you choose what to preserve:                      │
+│                                                                    │
+│    WIDE EXPONENT  →  huge dynamic range, FEW mantissa bits          │
+│    WIDE MANTISSA  →  fine precision, NARROW exponent (risk clip)   │
+│                                                                    │
+│     BF16:  same exponent width as FP32  (8 bits)                   │
+│            ↳ range like FP32  →  activations rarely clip           │
+│            ↳ only 7 mantissa bits  →  RELATIVE precision coarse    │
+│                                                                    │
+│     FP16: 5-bit exponent, 10-bit mantissa                          │
+│            ↳ MORE precise mantissa than BF16                       │
+│            ↳ SMALL max (~65504)  →  overflow in matmuls common      │
+│                                                                    │
+│  LLM training prefers range (BF16) over mantissa finesse FP16    │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Exercises
+## 3. VARIABLES
 
-1. Compute the total training memory (in GB) for LLaMA-3 8B with BF16 activations, FP32 master weights, FP32 optimizer states, and activation checkpointing (assume 2 GB saved activations).
-2. Why does BF16 not need loss scaling but FP16 does? Use the exponent bit counts to explain the underflow threshold difference.
-3. A gradient value is 2×10⁻⁸. In FP16 (min ≈6×10⁻⁵), does it underflow? In BF16 (min ≈9×10⁻⁴¹)? In FP32 (min ≈1.2×10⁻³⁸)?
+| Symbol | Meaning |
+|--------|---------|
+| \(S\) | Sign bit |
+| \(E\) | Exponent field width (bits) |
+| \(M\) | Mantissa (fraction) width (bits) |
+| bias | Exponent bias (format-dependent) |
+| \(S_{\mathrm{LS}}\) | Loss scale for FP16 (dynamic) |
+| \(\mathbf{W}_{32}\) | FP32 **master** weights |
+| \(\mathbf{G}_{16}\) | BF16/FP16 **gradients** |
+| \(\mathbf{m},\mathbf{v}\) | Adam first/second moments (typically FP32) |
+
+---
+
+## 4. IEEE-754 Style Layouts: FP32, BF16, FP16
+
+### 4.1 INTUITION: Bit Packing
+
+```
+           FP32  (32 bits)
+           ┌─┬────────┬───────────────────────────┐
+           │S│  Exp   │        Mantissa         │
+           └─┴────────┴───────────────────────────┘
+            1   8 bits          23 bits
+
+           BF16  (16 bits)  — "truncate" FP32 mantissa
+           ┌─┬────────┬──────────────┐
+           │S│  Exp   │   Mantissa   │   exponent SAME width as FP32
+           └─┴────────┴──────────────┘
+            1   8 bits      7 bits
+
+           FP16  (16 bits)  — rebalanced
+           ┌─┬─────┬──────────────┐
+           │S│ Exp │   Mantissa   │   5 exp / 10 mant
+           └─┴─────┴──────────────┘
+            1  5 bits   10 bits
+```
+
+**Normal numbers** (conceptual):
+
+\[
+(-1)^S \times 2^{e-\mathrm{bias}} \times (1 + m/2^M),
+\]
+
+with **stored** exponent bits encoding \(e\).
+
+| Format | S | E (exp bits) | M (mant bits) | Total | Approx max normal | Notes |
+|--------|---|--------------|---------------|-------|-------------------|-------|
+| FP32 | 1 | 8 | 23 | 32 | \(\sim 3.4\times 10^{38}\) | reference |
+| BF16 | 1 | 8 | 7 | 16 | \(\sim 3.4\times 10^{38}\) | truncates mantissa of FP32 |
+| FP16 | 1 | 5 | 10 | 16 | **65504** | much smaller max |
+
+**BF16:** Same **exponent** interpretation as FP32 (bias 127); mantissa is **truncated** from FP32, not renormalised with a new layout.
+
+**FP16:** 5-bit exponent (bias 15), 10-bit mantissa — **different tradeoff**: higher relative precision near 1, **tiny** absolute max compared to BF16.
+
+---
+
+## 5. Why BF16’s Exponent Range Matters
+
+Large matmuls accumulate **inner products** with magnitude \(\mathcal{O}(\sqrt{d}\cdot \sigma_x \sigma_w)\) in rough scaling. With \(d=4096\) and occasional large activations, **FP16** saturates (\(\pm 65504\)) → **Inf** in forward or backward → **NaN** loss.
+
+**BF16** rarely overflows to Inf for typical LLM ranges because its **ceiling** matches FP32-class exponents.
+
+Tiny gradients: **subnormals** and **underflow** differ by format; BF16 **normal** minimum \(\approx 1.75\times 10^{-38}\) (same order as FP32 normals — **not** FP16-tiny).
+
+---
+
+## 6. Training Stack: FP32 Master + BF16 Compute
+
+**Forward:**
+
+1. Cast \(\mathbf{W}_{32} \rightarrow \mathbf{W}_{\mathrm{bf16}}\) (on-the-fly or cached).
+2. Compute \(\mathbf{a}_{\ell} = \mathrm{Layer}_\ell(\mathbf{a}_{\ell-1}, \mathbf{W}_{\mathrm{bf16}})\) in BF16 Tensor Cores.
+
+**Backward:**
+
+1. Gradients \(\mathbf{G}_{\mathrm{bf16}}\) in BF16.
+2. **Upcast** to FP32 for **accumulation** into \(\mathbf{G}_{32}\) before **optimiser**.
+
+**Optimiser (AdamW):**
+
+\[
+\mathbf{m}_t = \beta_1 \mathbf{m}_{t-1} + (1-\beta_1)\mathbf{g}_{32},\quad
+\mathbf{v}_t = \beta_2 \mathbf{v}_{t-1} + (1-\beta_2)\mathbf{g}_{32}^2,
+\]
+\[
+\hat{\mathbf{m}}_t = \mathbf{m}_t/(1-\beta_1^t),\quad \hat{\mathbf{v}}_t = \mathbf{v}_t/(1-\beta_2^t),
+\]
+\[
+\mathbf{W}_{32} \leftarrow \mathbf{W}_{32} - \eta \frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t} + \epsilon} - \lambda \mathbf{W}_{32}
+\]
+(all in **high precision** for stability).
+
+---
+
+## 7. Loss Scaling for FP16 (Not BF16)
+
+FP16 gradients can **underflow** (become **zero**) because the **smallest normals** are \(\sim 6\times 10^{-5}\) and subnormals \(\sim 10^{-8}\) order.
+
+**Dynamic loss scaling** (Micikevicius et al., 2018):
+
+1. Multiply loss by **`S`** (e.g. \(2048\)): \(\tilde{\mathcal{L}} = S \mathcal{L}\).
+2. Backward yields \(\tilde{\mathbf{g}} = S \mathbf{g}\) in regions where autodiff is linear in \(\mathcal{L}\).
+3. Before Optimizer: \(\mathbf{g} = \tilde{\mathbf{g}} / S\).
+
+Adjust **`S`**: if **Inf/NaN**, skip step, **halve** `S`; if many good steps, **double** `S` slowly.
+
+**BF16:** Wide exponent → **loss scaling usually unnecessary** — simplifies training stack.
+
+---
+
+## 8. The Three-Copy Memory Picture
+
+For a parameter tensor, **training** commonly holds:
+
+| Copy | Precision | Purpose |
+|------|-----------|---------|
+| **Master weights** | FP32 | Small updates accumulate faithfully |
+| **Active / forward weights** | BF16 | Matmuls, Tensor Cores |
+| **Gradients** | BF16 | Backprop; then upcast |
+
+Plus **Adam**: \(\mathbf{m},\mathbf{v}\) in **FP32** → **two more** FP32 tensors per parameter in standard impl.
+
+**Rough bytes / param (Adam + BF16 grads + FP32 master):**
+
+- FP32 master: **4**
+- FP32 m: **4**
+- FP32 v: **4**
+- BF16 grad: **2**
+
+≈ **14 B/param** **order-of-magnitude** before activations (excludes optimiser fusion / 8-bit optim).
+
+**Example (8B weights, pure accounting):** \(8\times 10^9 \times 14\) B \(\approx 112\) GB for master+moments+BF16 grad **before** embeddings-only optimiser tricks — real stacks add **activation checkpointing**, **ZeRO**, or **8-bit Adam** to cut this.
+
+---
+
+## 9. FP8: E4M3 and E5M2
+
+**FP8** (\(\texttt{float8}\)) trades range/precision in **8 bits**:
+
+| Format | Sign | Exp | Mantissa | Typical use |
+|--------|------|-----|----------|-------------|
+| **E4M3** | 1 | 4 | 3 | Weights & activations (more precision) |
+| **E5M2** | 1 | 5 | 2 | Gradients (wider exponent, coarser mantissa) |
+
+**E4M3** max \(\sim 448\): **narrow** vs BF16 — requires **careful scaling** (block scaling, tensor scaling) in frameworks.
+
+Hardware (H100, etc.) accelerates FP8 GEMMs; **recipes** evolve with libraries (Transformer Engine, etc.).
+
+---
+
+## 10. Numerical Stability Analysis
+
+### 10.1 Rounding vs Deep Training
+
+BF16 has \(\sim 7\) fraction bits \(\Rightarrow\) **unit roundoff** \(u \approx 2^{-7}\) relative to significand, much coarser than FP32. **Error accumulation** over \(T\) steps is **not** simply \(T\cdot u\) (gradients fluctuate, signs cancel), but **systematic bias** in Adam can occur if small updates always round the same way — **FP32 master** amortises this.
+
+### 10.2 Reduction Kernels
+
+**1. Weight updates:** \(\Delta \mathbf{W} \sim \eta \mathbf{g}/(\sqrt{\hat{\mathbf{v}}}+\epsilon)\). If \(\mathbf{g}\) is BF16, **very small** updates can round to **zero** before hitting FP32 master — mitigated by **FP32 grads** in some stacks or **Stochastic rounding** (advanced).
+
+**2. Reductions:** LayerNorm / softmax accumulate in **FP32** in high-quality kernels (even if IO is BF16).
+
+**3. Adam \(\epsilon\):** Usually \(\sim 10^{-8}\) avoids division blow-ups; lives in FP32.
+
+### 10.3 Tensor Cores and Throughput
+
+NVIDIA **Tensor Cores** execute **WMMA**-style ops in **BF16/FP16** at **many×** the FP32 CUDA-core rate on datacentre GPUs. That is the **hardware** reason mixed precision dominates LLM training: **matmul-bound** steps become cheaper; memory bandwidth can become the **next** bottleneck (hence FlashAttention, sequence packing).
+
+**4. BF16 + large LR:** Can still diverge — mixed precision **does not** replace **schedule discipline**.
+
+---
+
+## 11. NUMERICAL EXAMPLES
+
+**Example A — BF16 mantissa spacing (order \(2^{-7}\) relative to significand scale):** Near value \(1.0\), spacing \(\Delta x \sim 2^{-7}\). An update \(\Delta w = 10^{-5}\) **larger** than spacing → representable after accumulation in **FP32** master.
+
+**Example B — FP16 max:** Value \(10^5\) exceeds FP16 max → **Inf** if tensor not scaled.
+
+**Example C — Gradient \(g = 2\times 10^{-8}\):** Compare roughly to FP16 normal min \(\sim 6\times 10^{-5}\): **underflows to 0** as normal; **BF16** (FP32-class range) represents small normals — **no forced zero** for this magnitude as in FP16 pathological case.
+
+**Example D — Loss scale:** True \(g=10^{-9}\). With \(S=2048\), \(\tilde{g}\sim 2\times 10^{-6}\), still small but **less likely** to flush in FP16.
+
+---
+
+## 12. Pseudocode
+
+```python
+# Mixed precision training (schematic)
+
+def forward_backward(model_fp32_master, data, loss_scaler=None):
+    # cast weights to bf16 for matmuls inside modules
+    loss = model_bf16_forward(model_fp32_master, data)  # BF16 compute
+
+    if loss_scaler is not None:
+        loss = loss * loss_scaler.get_scale()
+
+    loss.backward()   # BF16 grads in weights
+
+    if loss_scaler is not None:
+        loss_scaler.unscale_(optimizer)  # divide grads by S inside optim step
+        # detect inf, skip step, adjust S
+
+    # optimizer step on FP32 master + FP32 moments
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+For **BF16-only**, `loss_scaler` can be **disabled** in many LLM recipes.
+
+---
+
+## 13. COMMON MISTAKES
+
+| ❌ Wrong | ✓ Correct |
+|---------|-----------|
+| “BF16 = FP16.” | Different **exponent** width → different **overflow** behaviour. |
+| “No loss scaling → no training issues.” | Still need **FP32 master**, good **LR**, sometimes **grad clip**. |
+| “Three copies always fit in HBM.” | **Activations** often dominate; **checkpointing** changes footprint. |
+| “FP8 drop-in identical to BF16.” | FP8 needs **scaling** strategies; **max** for E4M3 ~448. |
+
+---
+
+## 14. EXERCISES
+
+1. Estimate total **optimiser + weight** memory for **8B** params: FP32 master, FP32 m,v, BF16 grads (ignore activations).
+
+2. Explain **why** dynamic loss scaling multiplies **loss** rather than **post-hoc** doubling gradients manually in each layer.
+
+3. Compare **smallest positive normal** for FP16 vs BF16 using exponent bias formulas (look up IEEE constants).
+
+4. **E4M3**: If tensor values exceed **448**, what happens without scaling? Propose mitigation at module boundary.
+
+5. **Mixed precision + AdamW:** Which tensors **must** stay FP32 for billion-step runs and why?
+
+6. **Forward-only inference:** Explain why **FP16/BF16 weights only** (no master) are common for deployment, while training keeps FP32 master.
+
+7. Derive order-of-magnitude for **relative** quantization error \(\Delta x / x\) for BF16 vs FP16 **near** \(x=1\) using mantissa bit counts.
+
+---
+
+**References:** Micikevicius et al., Mixed Precision Training (2018); NVIDIA A100/H100 docs; `torch.cuda.amp`, Transformer Engine; Kalamkar et al., Study of BFloat16 (2019); FP8 formats (NVIDIA, ARM, Graphcore whitepapers).

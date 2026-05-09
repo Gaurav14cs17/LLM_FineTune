@@ -1,210 +1,301 @@
-# 02 — Sampling Methods
+# Sampling Strategies for LLM Generation
 
-## 1. Temperature Sampling — Mathematical Analysis
+Mathematical survey of **stochastic decoding**: **temperature scaling**, **top-\(k\)**, **top-\(p\)** (nucleus), **min-\(p\)**, **repetition penalties**, **typical sampling (information-theoretic)**, and why sampling explores **high-entropy** creative regions that greedy/beam underutilize.
 
-```
-STANDARD SOFTMAX:
-  P(wₜ = k | context) = exp(zₖ) / ∑_j exp(zⱼ)
+---
 
-TEMPERATURE T MODIFICATION:
-  P_T(wₜ = k | context) = exp(zₖ/T) / ∑_j exp(zⱼ/T)
+## Table of Contents
 
-  This is equivalent to SCALING ALL LOGITS by 1/T before softmax.
+- [1. Variables](#1-variables)
+- [2. Intuition — Shaping the Next-Token Distribution](#2-intuition--shaping-the-next-token-distribution)
+- [3. Temperature Scaling](#3-temperature-scaling)
+- [4. Top-\(K\) Sampling](#4-top-k-sampling)
+- [5. Top-\(P\) (Nucleus) Sampling](#5-top-p-nucleus-sampling)
+- [6. Min-\(P\) Filtering](#6-min-p-filtering)
+- [7. Repetition Penalty / Logit Processing](#7-repetition-penalty--logit-processing)
+  - [7.1 Logit bias decomposition](#71-logit-bias-decomposition)
+- [8. Typical Sampling (Brief Information-Theoretic View)](#8-typical-sampling-brief-information-theoretic-view)
+  - [8.1 Softmax Jacobian and temperature sensitivity](#81-softmax-jacobian-and-temperature-sensitivity)
+  - [8.2 Typical threshold (conceptual recipe)](#82-typical-threshold-conceptual-recipe)
+- [9. Why Sampling Beats Greedy/Beam for Diversity](#9-why-sampling-beats-greedybeam-for-diversity)
+- [10. Pseudocode](#10-pseudocode)
+- [11. Numerical Examples](#11-numerical-examples)
+- [12. Common Mistakes](#12-common-mistakes)
+- [13. Exercises](#13-exercises)
 
-EFFECT ON DISTRIBUTION:
-  T → 0 (very cold): all probability concentrates on argmax → greedy decoding
-  T = 1 (neutral):   standard model distribution
-  T → ∞ (very hot):  all probabilities → 1/|V| → uniform (completely random)
+---
 
-MATHEMATICAL PROOF of T→0 behavior:
-  P_T(k) = exp(zₖ/T) / ∑_j exp(zⱼ/T)
-  
-  Let k* = argmax_k zₖ (the highest-logit token).
-  Divide numerator and denominator by exp(z_{k*}/T):
-  
-  P_T(k) = exp((zₖ − z_{k*})/T) / ∑_j exp((zⱼ − z_{k*})/T)
-  
-  As T → 0:
-    For k = k*: numerator = exp(0) = 1,  denominator → 1 + 0 + 0 + ... = 1
-    → P_T(k*) → 1  ✓
-    
-    For k ≠ k*: numerator = exp((zₖ − z_{k*})/T) → exp(−∞) = 0  (since zₖ < z_{k*})
-    → P_T(k) → 0  ✓
+## 1. Variables
 
-TEMPERATURE AND ENTROPY:
-  H_T = −∑_k P_T(k) log P_T(k)   (entropy of temperature-scaled distribution)
-  
-  dH_T/dT > 0:  higher temperature → higher entropy → more diverse outputs
-  dH_T/dT < 0:  lower temperature → lower entropy → less diverse, more focused
-  
-  Optimal T for a task:
-    Factual QA: T ≈ 0.1-0.3  (want near-deterministic correct answer)
-    Creative writing: T ≈ 0.7-1.2  (want diverse, non-repetitive text)
-    Code generation: T ≈ 0.2-0.4  (want syntactically correct output)
-```
+| Symbol | Meaning |
+|--------|---------|
+| \(z_k\) | Logit for token \(k\) at current step |
+| \(T\) | **Temperature** (not sequence length here) |
+| \(\tau\) | Sometimes used for temperature; we use \(T\) in formulas **except** where noted |
+| \(K\) | Top-\(k\) cutoff count |
+| \(p\) | Nucleus mass threshold in \((0,1]\) |
+| \(\mathrm{min\_p}\) | Min-\(p\) threshold factor vs running max prob |
+| \(H(P)\) | Shannon entropy of distribution \(P\) |
+| \(P(w)\) | Final sampling distribution after **all** transforms |
 
-## 2. Top-k Sampling — Mathematical Definition
+---
+
+## 2. Intuition — Shaping the Next-Token Distribution
 
 ```
-TOP-k SAMPLING ALGORITHM:
-  
-  STEP 1: Get logits z ∈ ℝ^{|V|}
-  STEP 2: Find top-k tokens: V_k = argmax^k_j z_j  (k tokens with highest logits)
-  STEP 3: Zero out all other tokens:
-            z̃_j = z_j  if j ∈ V_k
-            z̃_j = −∞  otherwise
-  STEP 4: Sample from softmax(z̃)
-
-EFFECTIVE DISTRIBUTION:
-  P_topk(j) = exp(z_j) / ∑_{i ∈ V_k} exp(z_i)   for j ∈ V_k
-  P_topk(j) = 0                                    for j ∉ V_k
-
-PROBLEM WITH TOP-k:
-  k is FIXED regardless of how peaked or flat the distribution is.
-  
-  CASE 1: Very peaked distribution (high confidence context):
-    P(token "Paris") = 0.9,  P(token "London") = 0.05, ...
-    Top-k=50 → sampling from 50 tokens even though most probability is in 1-2 tokens
-    → Many low-quality tokens (rank 3-50) can be sampled unnecessarily
-  
-  CASE 2: Flat distribution (high uncertainty context):
-    P(token 1) = 0.05, P(token 2) = 0.049, ..., P(token 100) = 0.04
-    Top-k=50 → cuts off many reasonable candidates at token 50
-    → Arbitrary truncation, misses valid continuations
-
-k-value sensitivity:
-  k = 1:     greedy (deterministic)
-  k = 10:    focused, low diversity
-  k = 50:    moderate (standard)  ← GPT-2 default
-  k = 200:   high diversity
-  k = |V|:   no truncation (standard sampling)
+     Raw logits z
+         │
+         ▼
+   ┌─────────────┐     T<1: sharpen (low entropy)   T>1: flatten (high entropy)
+   │  / T soft   │
+   └─────────────┘
+         │         top-k / top-p / min-p prune unlikely mass
+         ▼
+   renormalize on survivors ──► sample w
 ```
 
-## 3. Top-p (Nucleus) Sampling — Full Derivation
+**Takeaway:** Sampling is **not** one trick—it is a **pipeline** of monotone / pruning operations followed by **exact sampling** from the resulting distribution.
+
+---
+
+## 3. Temperature Scaling
+
+Let logits \(\{z_k\}_{k\in V}\). Temperature \(T>0\):
+
+\[
+P_T(k) = \frac{\exp(z_k / T)}{\sum_{j\in V} \exp(z_j / T)}.
+\]
+
+**Limits:**
+
+- \(T\to 0^+\): **one-hot** on \(\arg\max_k z_k\) (greedy).
+- \(T\to +\infty\): approaches **uniform** over \(V\).
+
+**Entropy monotonicity (qualitative):** For typical LM logits, increasing \(T\) **raises** next-token entropy \(H(P_T)\) until saturating near uniform.
+
+---
+
+## 4. Top-\(K\) Sampling
+
+Let \(\mathcal{S}_K\) be the set of \(K\) tokens with highest **raw** (or temperature-scaled) probabilities. **Restrict** support to \(\mathcal{S}_K\), then renormalize:
+
+\[
+P_{\mathrm{top-}K}(k) \propto \begin{cases}
+P_T(k), & k\in \mathcal{S}_K \\
+0, & \text{otherwise}
+\end{cases}
+\]
+
+**Edge case:** Ties and numerics may shuffle boundary tokens—implementation detail.
+
+---
+
+## 5. Top-\(P\) (Nucleus) Sampling
+
+Sort probabilities descending: \(p_{(1)} \ge p_{(2)} \ge \cdots\).
+
+Find smallest prefix index \(m\) such that
+
+\[
+\sum_{i=1}^{m} p_{(i)} \ge p_{\mathrm{nucleus}}.
+\]
+
+Keep tokens \(\{(1),\ldots,(m)\}\), renormalize.
+
+**Interpretation:** Adaptively widen/shrink candidate set based on **confidence mass**; **flat** distributions keep many tokens, **peaked** distributions auto-restrict.
+
+---
+
+## 6. Min-\(P\) Filtering
+
+Let \(p_{\max} = \max_k P_T(k)\). Keep token \(k\) iff
+
+\[
+P_T(k) \ge \mathrm{min\_p} \times p_{\max}.
+\]
+
+**Effect:** When the model is **very peaked** (\(p_{\max}\approx 1\)), threshold is strict; when the model is **flat**, absolute floor lowers, preserving many options. This **couples threshold to sharpness**.
+
+---
+
+## 7. Repetition Penalty / Logit Processing
+
+A common **heuristic**:
+
+\[
+z'_k =
+\begin{cases}
+z_k / \rho,& \text{if token }k\text{ appeared recently in context} \\
+z_k,& \text{otherwise}
+\end{cases}
+\]
+
+with \(\rho>1\). Then apply softmax on \(z'\).
+
+**Caveat:** This **breaks** strict probabilistic semantics—it is **not** sampling from the model’s true \(P_\theta\) anymore unless justified as **guided decoding**.
+
+### 7.1 Logit bias decomposition
+
+Any pipeline that maps logits \(z\mapsto z+b(z,\text{context})\) then softmax is equivalent to multiplying **unnormalised** probabilities by **positive** factors \(\exp(b_k)\) that may depend on entire histories. This is a **controlled Markovian logit change** only if \(b_k\) depends on \((k,\text{small finite state})\); repetition modifiers depending on large windows create **non-Markov** decoding **even if the base LM is Markov** of order fixed by context length.
+
+---
+
+## 8. Typical Sampling (Brief Information-Theoretic View)
+
+**Informal idea:** among tokens with sufficiently high \(P(k)\), prefer those whose **information** \(I(k)=-\log P(k)\) lands near **expected information** \(\approx H(P)\)—i.e., **neither** extreme flukes **nor** near-deterministic repeats.
+
+**Motivation:** Extremely improbable tails are often gibberish; extremely high-probability tokens can drive dull loops—**typical set** language borrows from **typicality** in information theory.
+
+### 8.1 Softmax Jacobian and temperature sensitivity
+
+Let \(p = \mathrm{softmax}(z/T)\). For finite differences,
+
+\[
+\frac{\partial p_k}{\partial z_j}
+= \frac{1}{T} p_k(\delta_{kj} - p_j).
+\]
+
+At **low** \(T\), eigenvalues of the Jacobian (**shrink** off-argmax directions) grow in separation—distribution becomes **peaky**. At **high** \(T\), mass equilibrates—**flat**.
+
+### 8.2 Typical threshold (conceptual recipe)
+
+Let \(Z=-\log P_T(k)\) (random information). **Typical sampling** retains token \(k\) if
+
+\[
+|Z - H(P_T)| \le \Delta,
+\]
+
+or uses **quantile bands** around \(H(P_T)\), then renormalizes. The hyperparameter \(\Delta\) trades tail trimming vs diversity.
+
+---
+
+## 9. Why Sampling Beats Greedy/Beam for Diversity
+
+- **High-entropy regimes** (creative writing, persona) benefit from **stochasticity**: draws from **multi-modal** conditional distributions explore **different basins** of plausible text.
+- **Greedy** collapses to a **single mode chain**—often repetitive or locally optimal but globally bland.
+- **Beam** enumerates **high-probability** shortlist but still **suppresses** many **valid** medium-probability continuations; it optimizes **probability**, not subjective **novelty**.
+
+**ASCII intuition:**
 
 ```
-TOP-p (NUCLEUS) SAMPLING (Holtzman et al. 2019):
-  Instead of a fixed count k, use a DYNAMIC vocabulary based on cumulative probability.
+Prob.simplex (triangle sketch):
 
-ALGORITHM:
-  STEP 1: Sort tokens by probability (descending):
-            π(1), π(2), ..., π(|V|) where P(π(1)) ≥ P(π(2)) ≥ ...
-  
-  STEP 2: Find nucleus size n*(p):
-            n*(p) = min{n : ∑_{i=1}^{n} P(π(i)) ≥ p}
-            (smallest set covering at least p of the probability mass)
-  
-  STEP 3: Sample from the nucleus:
-            P_nucleus(j) = P(j) / ∑_{i ∈ nucleus} P(i)   for j in nucleus
-            P_nucleus(j) = 0   otherwise
-
-ADAPTIVE BEHAVIOR:
-  High confidence context (P("Paris")=0.9, p=0.95):
-    n*(0.95) = 2  (just "Paris" and one more token cover 95%)
-    → Effectively k=2, very focused
-  
-  Low confidence context (P(j) ≈ 0.01 for many j, p=0.95):
-    n*(0.95) = 95  (need 95 tokens to cover 95% probability)
-    → Effectively k=95, wide vocabulary
-
-MATHEMATICAL PROPERTY:
-  The nucleus probability mass is EXACTLY ≥ p by construction.
-  The normalised distribution over nucleus: ∑ P_nucleus = 1 ✓
-  
-  Expected quality of sampled token:
-    E_{j~P_nucleus}[P_true(j)] = ∑_{j ∈ nucleus} P_nucleus(j) × P_true(j)
-    
-    For a good model (P_true ≈ P_model):
-    E[P_true] ≈ ∑_{j ∈ nucleus} P(j)² / ∑_{i ∈ nucleus} P(i)  (higher than average P)
-    → Nucleus sampling selects high-quality tokens while maintaining diversity
-
-EFFECT OF p:
-  p = 0.5: very small nucleus (greedy-like, focused)
-  p = 0.9: standard choice (Holtzman et al. recommendation)
-  p = 0.95: slightly more diverse
-  p = 1.0: all tokens (equivalent to pure temperature sampling)
-```
-
-## 4. Min-p Sampling — New Alternative
-
-```
-MIN-p SAMPLING (2024, community invention):
-  Dynamic cutoff based on a FRACTION of the maximum probability.
-
-  Dynamic threshold:  θ(context) = p_base × P(most_likely_token)
-  
-  Include token j if P(j) ≥ θ(context)
-
-ALGORITHM:
-  p_max = max_j P(j)
-  include j if P(j) ≥ p_base × p_max
-
-NUMERICAL EXAMPLE:
-  Logits give P = [0.5, 0.3, 0.1, 0.05, 0.03, 0.02]  (sorted desc)
-  p_max = 0.5
-  
-  With p_base = 0.1:  threshold = 0.1 × 0.5 = 0.05
-    Include tokens with P ≥ 0.05: {0.5, 0.3, 0.1, 0.05} ← 4 tokens
-  
-  With p_base = 0.1 in a flat distribution:
-  P = [0.1, 0.09, 0.08, 0.07, 0.06, 0.05, ...] (flat)
-  p_max = 0.1, threshold = 0.01
-    Include tokens with P ≥ 0.01: many tokens ← wide distribution!
-
-ADVANTAGE over Top-p:
-  Top-p: nucleus grows linearly as distribution flattens.
-  Min-p: nucleus grows in proportion to the RATIO p/p_max → more adaptive.
-  
-  Both adapt to distribution sharpness, but min-p uses relative rather than absolute threshold.
-```
-
-## 5. Combining Sampling Methods — Recommended Recipes
-
-```
-TYPICAL PRODUCTION CONFIGURATIONS:
-
-For CREATIVE TASKS (story writing, dialogue):
-  T = 0.7-1.0 + top_p = 0.9
-  
-  REASONING:
-  T=0.9 adds noise → diverse generation
-  top_p=0.9 removes the lowest-quality tokens → prevents garbage tokens
-  
-  Combined distribution:
-  P_combined(j) ∝ exp(zⱼ/T) × 1[j ∈ nucleus(p=0.9)]
-
-For FACTUAL TASKS (QA, code):
-  T = 0.1-0.3 + top_k = 10-50
-  
-  REASONING:
-  Low T → concentrated around best answers
-  top_k = safety net to prevent degenerate low-probability samples
-
-For INSTRUCTION FOLLOWING (chatbots):
-  T = 0.6-0.8 + top_p = 0.9 (or similar)
-  ← OpenAI API default: T=1.0 with top_p as the primary control
-
-REPETITION PENALTY (frequency/presence penalty):
-  Modify logits based on token frequency in already-generated text:
-    z̃ⱼ = zⱼ − α × count(j in context)    (frequency penalty)
-    z̃ⱼ = zⱼ − β × 1[j in context]        (presence penalty)
-  
-  MATHEMATICAL EFFECT:
-    Each time token j is generated, its logit decreases by α (frequency) or β (presence).
-    This makes the model AVOID repeating the same tokens.
-    
-  OPTIMAL α/β:
-    α too small: repetition persists ("the the the" or paragraph loops)
-    α too large: model avoids even necessary repetitions (can't refer to previous entities)
-    
-    Typical: α = 1.1-1.3, β = 0-0.2  for chat models
-             α = 0 for code (variable names must repeat!)
+        high prob mass ●●●   ← greedy/beam hug these peaks
+              ○  ○          ← sampling visits varied interior points
 ```
 
 ---
 
-## Exercises
+## 10. Pseudocode
 
-1. Prove mathematically that as T → ∞, the softmax distribution approaches uniform. Show that limT→∞ exp(zk/T)/∑j exp(zj/T) = 1/|V|.
-2. For P = [0.4, 0.3, 0.2, 0.06, 0.04] and p=0.9, find the nucleus manually. Compare to top-k=3. Which set is larger, and why does top-p adapt better here?
-3. Compute the entropy H(P_T) for P=[0.6, 0.3, 0.1] at T=0.5, T=1.0, T=2.0. Show the monotonic relationship between T and H.
+```
+function temperature(logits z, T):
+    return softmax(z / T)
+
+function top_k(logits z, K):
+    idx ← indices of K largest z
+    mask all other logits → −∞
+    return softmax(masked z)
+
+function top_p(probs P, p_mass):
+    sort tokens by P descending
+    take minimal prefix with cumulative ≥ p_mass
+    zero out others; renormalize
+
+function min_p_filter(probs P, min_p):
+    pmax ← max P
+    keep k where P[k] ≥ min_p * pmax
+    zero others; renormalize
+
+function sample_token(P):
+    return categorical_draw(P)
+
+# Typical pipeline:
+P ← softmax(z / T)
+P ← top_p(P, p_nucleus)   # or top_k first; order matters—document your stack!
+P ← min_p_filter(P, min_p)
+w ← sample_token(P)
+```
+
+---
+
+## 11. Numerical Examples
+
+### Example 1 — Temperature effect
+
+Suppose two leading logits: \(z_1=2.0, z_2=1.0\).
+
+- At \(T=1\): \(p_1 \propto e^{2}\approx 7.39,\; p_2 \propto e^{1}\approx 2.72\), \(p_1 \approx 0.73\).
+- At \(T=2\): \(p_1 \propto e^{1},\, p_2 \propto e^{0.5}\), closer probabilities (\(p_1 \approx 0.62\)).
+
+### Example 2 — Top-\(p\) nucleus
+
+Sorted probs: \((0.50, 0.25, 0.15, 0.08, 0.02)\).
+
+Cumulative:
+
+- Prefix 1: 0.50 (<0.9)
+- Prefix 2: 0.75 (<0.9)
+- Prefix 3: **0.90** (meets \(p_{\mathrm{nucleus}}=0.9\))
+
+Keep top **3** tokens.
+
+### Example 3 — Min-\(p\)
+
+If \(\max_k P(k)=0.6\) and \(\mathrm{min\_p}=0.1\), threshold \(=0.06\). Tokens below 0.06 vanish after renormalize.
+
+### Example 4 — Pipeline order matters
+
+Consider \(T=1\), base probs roughly uniform after top-\(p\). Apply **min-\(p\)** *before* nucleus: rare tails may already be removed; **reapplying** top-\(p\) second can yield a **different** support than **nucleus then min-\(p\)**. Always record the **exact commutative diagram** your framework uses.
+
+### Example 5 — Entropy of two-level softmax
+
+For logits \((z,0)\), softmax \(p=(p,1-p)\) with \(p=\frac{e^z}{1+e^z}\). Entropy
+\[
+H(p)=-p\log p-(1-p)\log(1-p)
+\]
+is maximized at \(p=\tfrac{1}{2}\) (maximum **uncertainty** on binary choice).
+
+---
+
+## 12. Common Mistakes
+
+- ❌ **Stack top-\(k\) after top-\(p\) without thinking** about double truncation.
+
+  ✓ Document **order**; ablate settings per model family.
+
+- ❌ **Use high temperature to “fix” bad prompting.**
+
+  ✓ Coherence issues often originate in **context**, not decoding alone.
+
+- ❌ **Assume repetition penalty conserves a proper sampling from \(P_\theta\).**
+
+  ✓ It is **biased** decoding—evaluate if that's acceptable.
+
+- ❌ **Set nucleus \(p\) extremely close to 1 on huge vocab.**
+
+  ✓ You may **re-enable** rare junk tokens; pair with min-\(p\) or tail tests.
+
+- ❌ **Confuse entropy of **one** next-token draw with long-sequence diversity.**
+
+  ✓ **Drift** across many steps can still collapse; **block** repetition patterns separately.
+
+---
+
+## 13. Exercises
+
+1. Prove \(\lim_{T\to 0^+} P_T\) concentrates on \(\arg\max z\) assuming unique maximum.
+
+2. Show top-\(K\) can **drop** the true greedy token **never** if you select \(K\) from **post-temperature** logits correctly—when can ties fool this?
+
+3. **Design** a min-\(p\) case that **removes** all tokens except the argmax—when?
+
+4. Express **entropy** \(H(P_T)\) derivative w.r.t. \(T\) qualitatively for 2-token distributions.
+
+5. Compare typical sampling to **entropy clipping**—when might they disagree?
+
+---
+
+### Summary
+
+Sampling reshapes **which modes** you expose from \(\mathbb{R}^{|V|}\) **logit simplices**. Understand your **pipeline order**, measure **perplexity / win-rates / diversity** jointly, and remember: **no free lunch** between creativity and factuality.

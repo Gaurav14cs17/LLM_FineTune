@@ -1,182 +1,308 @@
-# 03 — QLoRA: Quantised Low-Rank Adaptation
+# QLoRA — Quantized LoRA for Memory-Efficient Fine-Tuning
 
-## 1. Quantisation Background — NF4 Data Type
+This note formalizes **QLoRA**: base weights stored in **4-bit Normal Float (NF4)**, low-rank adapters trained in **BF16**, **double quantization** of scales, **paged optimizers**, memory accounting, and why **NF4** is effective for Gaussian-like matrices. Includes training recipe and indicative memory comparisons.
 
-```
-QUANTISATION: represent floating-point values with fewer bits.
+---
 
-4-BIT QUANTISATION (16× compression vs FP32):
-  Original: FP32 value w ∈ ℝ
-  Quantised: q ∈ {0,1,...,15}  (4 bits = 16 discrete levels)
-  
-  LINEAR QUANTISATION:
-    q = round(w / scale_factor)   where scale = (w_max − w_min) / 15
-    w ≈ q × scale_factor + zero_point
-  
-  PROBLEM: LLM weights follow a roughly Gaussian N(0,1) distribution.
-    Linear quantisation wastes levels on the flat tails!
-    Most values near 0 (dense region) get poor precision.
+## Table of Contents
 
-NF4 (Normal Float 4, Dettmers et al. 2023):
-  Designed specifically for Gaussian-distributed weights!
-  
-  CONSTRUCTION: choose 16 quantisation levels to be the expected values of
-  16 equal-probability bins of N(0,1):
-  
-  qi = E[X | X ∈ [Φ⁻¹((i)/16), Φ⁻¹((i+1)/16)]]   for i = 0, ..., 15
-  
-  where Φ⁻¹ is the inverse CDF of N(0,1).
-  
-  NF4 LEVELS (symmetric, normalised to [-1, 1]):
-  {-1.000, -0.694, -0.520, -0.394, -0.289, -0.194, -0.105, -0.021,
-    0.079,  0.187,  0.303,  0.432,  0.584,  0.776,  1.000, [unused]}
-  
-  Wait — that's only 15 values. NF4 uses 16 values symmetric around 0.
-  
-  INFORMATION THEORY ARGUMENT:
-    NF4 is INFORMATION-THEORETICALLY OPTIMAL for normally distributed weights.
-    
-    PROOF: Lloyd's optimal quantisation theorem states that for any distribution,
-    the quantisation error is minimised when levels are at the centroids of each
-    equal-probability bin (equal-frequency quantisation).
-    
-    For N(0,1): equal-probability bins = equal percentile ranges.
-    NF4 uses these exact centroids → minimises MSE for Gaussian weights!
-```
+- [1. Variables](#1-variables)
+- [2. Intuition — Frozen 4-bit Base, High-precision Adapters](#2-intuition--frozen-4-bit-base-high-precision-adapters)
+- [3. LoRA Recap (Low-Rank Update)](#3-lora-recap-low-rank-update)
+- [4. NF4 and Information-Theoretic Optimality for Gaussian Weights](#4-nf4-and-information-theoretic-optimality-for-gaussian-weights)
+- [5. Double Quantization](#5-double-quantization)
+- [6. Paged Optimizers and Memory Spikes](#6-paged-optimizers-and-memory-spikes)
+- [7. Memory Footprint Formula](#7-memory-footprint-formula)
+- [8. Training Recipe (Practical Pseudocode)](#8-training-recipe-practical-pseudocode)
+- [9. Memory Comparison — Full FT vs LoRA vs QLoRA](#9-memory-comparison--full-ft-vs-lora-vs-qlora)
+- [10. Numerical Examples](#10-numerical-examples)
+- [Appendix: Lloyd-Max link (qualitative)](#appendix-lloyd-max-link-qualitative)
+- [11. Common Mistakes](#11-common-mistakes)
+- [12. Exercises](#12-exercises)
 
-## 2. Double Quantisation — Memory Calculation
+---
+
+## 1. Variables
+
+| Symbol | Meaning |
+|--------|---------|
+| \(W \in \mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}\) | Original linear weight matrix |
+| \(Q(W)\) | Quantized storage of base weights (e.g., NF4 blocks + scales) |
+| \(A \in \mathbb{R}^{r\times d_{\mathrm{in}}},\, B \in \mathbb{R}^{d_{\mathrm{out}}\times r}\) | LoRA factors, \(r \ll \min(d_{\mathrm{in}},d_{\mathrm{out}})\) |
+| \(\alpha\) | LoRA scaling hyperparameter (\(\Delta W = (\alpha/r)\,B A\) in common conventions) |
+| \(b\) | Quantization bitwidth for base weights (here \(b=4\)) |
+| \(s,\, z\) | Per-block **scale** and **zero-point** (or bias) used to map codes to floats |
+| \(M\) | Total GPU memory footprint (order-of-magnitude accounting) |
+| \(\Theta_{\mathrm{LoRA}}\) | Trainable adapter parameters only |
+| **NF4** | Normal Float 4-bit: 16-bin quantisation tailored near \(\mathcal{N}(0,1)\) |
+
+---
+
+## 2. Intuition — Frozen 4-bit Base, High-precision Adapters
 
 ```
-STANDARD QUANTISATION:
-  For each block of 64 weights, we need one quantisation constant (scale factor).
-  Extra memory: (N_params / 64) × 4 bytes per scale  (FP32 scale)
-  
-  For 8B parameters:
-    = 8×10⁹/64 × 4 bytes = 500 MB of quantisation constants!  (non-trivial)
+FULL FINE-TUNE (expensive):
+  W  (FP16/BF16)  ──optimize──►  W'     (every element moves)
 
-DOUBLE QUANTISATION (QLoRA):
-  Quantise the quantisation constants themselves!
-  
-  Step 1: Quantise model weights W to NF4 with FP32 scale factors
-    Memory for scales: (N/64) × 4 bytes = 500 MB (as above)
-  
-  Step 2: Group scale factors into blocks of 256, quantise scales to FP8
-    Memory for scale-of-scales: (N/64)/256 × 1 byte = 1.95 MB (tiny!)
-    Memory for FP8 scales:      (N/64) × 1 byte = 125 MB
-  
-  TOTAL MEMORY FOR QUANTISATION CONSTANTS:
-    Without DQ: 500 MB
-    With DQ:    125 MB + 1.95 MB ≈ 127 MB  (saves 373 MB!)
+LoRA (lighter):
+  W  (FP/BF16)  frozen |||||||||||
+                ΔW = B·A  (tiny rank r)  ──optimize──►  A,B only
 
-TOTAL MEMORY — 4-BIT MODEL:
-  Weights (NF4, 4 bits per param): 8×10⁹ × 0.5 bytes = 4 GB
-  Quantisation constants (DQ):     127 MB
-  ─────────────────────────────────────────
-  Total quantised model: ~4.1 GB  (vs 16 GB for BF16!)
-  
-  MEMORY SAVINGS: 16 GB → 4.1 GB ← fits in single consumer GPU (12 GB VRAM)!
+QLoRA (lighter still):
+  Q(W)  NF4 in VRAM  ─frozen, dequant on-the-fly in matmul────►  hidden states
+            │
+            └──►  + (α/r) B A   (BF16 adapters trained)
 ```
 
-## 3. Paged Optimisers — Dealing with GPU OOM
+**Intuition:** Most “task signal” lives in a **low-dimensional subspace** of updates (LoRA hypothesis). QLoRA compresses the **massive** base in NF4 but keeps **adapter dynamics** in high enough precision that optimisation remains well-conditioned.
+
+---
+
+## 3. LoRA Recap (Low-Rank Update)
+
+Forward pass of a single linear (ignoring biases):
+
+\[
+y = W x + \frac{\alpha}{r}\, B A x,\qquad \mathrm{rank}(BA)\le r.
+\]
+
+**Gradients:**
+
+- If \(W\) is frozen, \(\partial \mathcal{L}/\partial W = 0\) (in true freeze).
+- Gradients flow to \(A,B\) through the adapter path; **activations** \(x\) still **pass through dequantized** \(W\) in QLoRA.
+
+**Computational graph:**
+
+\[
+x \xrightarrow{\text{dequant } \hat{W}} \hat{W}x \;+\; \frac{\alpha}{r} BAx.
+\]
+
+Here \(\hat{W}\) is **not stored** in FP16; it is reconstructed per kernel from codes + scales.
+
+---
+
+## 4. NF4 and Information-Theoretic Optimality for Gaussian Weights
+
+Empirically, many Transformer weights exhibit **approximately unimodal, bell-shaped** distributions after layer normalization and scaling. A coarse model is \(w \sim \mathcal{N}(0,\sigma^2)\).
+
+### 4.1 Equal-probability bins on the Gaussian
+
+Let \(\Phi\) be the CDF of \(\mathcal{N}(0,1)\). Partition \(\mathbb{R}\) into 16 intervals \(\{I_1,\ldots,I_{16}\}\) with equal mass:
+
+\[
+\mathbb{P}(w \in I_k) = \frac{1}{16}.
+\]
+
+**Lloyd-type centroid quantisation** chooses representative levels \(q_k\) to minimise MSE:
+
+\[
+\min_{\{q_k\}} \mathbb{E}\bigl[(w - q(w))^2\bigr],\quad q(w)\in\{q_1,\ldots,q_{16}\}.
+\]
+
+For equal-probability bins under a smooth density, **conditional expectations** \(q_k = \mathbb{E}[w \mid w\in I_k]\) **minimize bin-wise squared error** structure; NF4 uses a **fixed** 16-level codebook designed around \(\mathcal{N}(0,1)\) **then applies a per-tensor scale** to fit empirical spread.
+
+### 4.2 Why “Gaussian-optimality” is plausible
+
+- If weights are **exactly** Gaussian, fixed **equal-density** bins + centroid levels minimise **mean squared quantisation error** under certain regularity assumptions (Lloyd-Max intuition).
+- Real networks deviate: outliers, asymmetric layers. In practice, **blockwise scales** restore dynamic range.
+
+**ASCII sketch (symmetric binning idea):**
 
 ```
-PROBLEM: Even with 4-bit base model, the LoRA adapter optimiser states need memory.
-  LoRA r=16: 42M trainable params × 8 bytes per param (FP32 Adam m,v) = 336 MB
+   p(w)
 
-SPIKES during training:
-  Gradient accumulation: temporary copies of full activations.
-  For batch with very long sequences (e.g., 4096 tokens × BS=4):
-    Activation memory peak ≈ 10-30 GB!  → GPU OOM even with 4-bit model.
-
-PAGED OPTIMISER SOLUTION (using NVIDIA unified memory):
-  1. Allocate optimiser states as PAGE-ABLE CPU memory.
-  2. Page in relevant pages to GPU when needed for update.
-  3. Page out to CPU when GPU memory is needed for activations.
-  
-  KEY MECHANISM:
-    - NVIDIA's CUDA Unified Memory automatically handles CPU↔GPU page transfers.
-    - During forward/backward: optimiser states offloaded to CPU.
-    - During optimizer step: page needed param group's states to GPU, update, page out.
-  
-  OVERHEAD:
-    PCIe bandwidth: 16 GB/s (gen4) → transfer 336 MB ≈ 21 ms overhead
-    Training step ≈ 200 ms → overhead ≈ 10%  (acceptable!)
-  
-  BENEFIT: can train on GPUs with 12-16 GB VRAM instead of needing 40-80 GB!
-```
-
-## 4. QLoRA Forward Pass — Dequantisation
-
-```
-INFERENCE/TRAINING with QLoRA:
-
-BASE MODEL (frozen, stored in NF4):
-  W_NF4 ∈ {level_0, ..., level_15}^{d_out × d_in/2}   ← 4 bits per element
-
-FORWARD PASS for input x:
-  Step 1: DEQUANTISE block-by-block:
-    For each block b of 64 weights:
-      W_fp16[b] = lookup_NF4(W_NF4[b]) × scale_b_fp16
-      (NF4 lookup table: 16 values → 16 BF16 values)
-  
-  Step 2: COMPUTE base output (BF16):
-    h_base = x · W_fp16   (standard BF16 matmul)
-  
-  Step 3: COMPUTE LoRA output (BF16):
-    h_lora = (x · A) · B × (α/r)   (LoRA adapter, both A and B in BF16)
-  
-  Step 4: SUM:
-    h = h_base + h_lora   (final output)
-
-GRADIENT FLOW:
-  ∂L/∂A and ∂L/∂B flow normally through step 3 (trainable).
-  ∂L/∂W_NF4 = 0  (base weights are frozen, no gradient needed).
-  
-  This is why NF4 storage is fine: we only ever READ the base weights,
-  never UPDATE them. The quantisation error is fixed (no gradient noise).
-
-QUANTISATION ERROR BOUND:
-  For NF4 on N(0,σ²) distributed weights:
-  E[|w - q(w)|²] ≤ σ²/4  ← error bounded by σ²/16 × 4 = σ²/4  per element
-  
-  For σ = 0.02 (LLaMA init): MSE ≤ (0.02)²/4 = 10⁻⁴ per element.
-  Relative error: √(10⁻⁴)/(0.02) = 50% ← sounds bad!
-  
-  BUT: the LoRA adapter can compensate for systematic quantisation error!
-  The adapter learns to correct the bias introduced by quantisation.
-  This is why QLoRA quality ≈ LoRA quality ≈ full fine-tuning quality.
-```
-
-## 5. Memory Budget Summary
-
-```
-FINE-TUNING LLaMA-3 8B with QLoRA (r=16, all attention + FFN):
-
-Component                    Bytes per param   Total
-────────────────────────────────────────────────────
-Base model (NF4)              0.5 bytes         4.0 GB
-Quantisation constants (DQ)   ~0.016 bytes      128 MB
-LoRA A, B params (BF16)       2 bytes/lora      84 MB  (42M × 2)
-Gradient for LoRA (BF16)      2 bytes           84 MB
-Adam m (FP32)                 4 bytes          168 MB
-Adam v (FP32)                 4 bytes          168 MB
-Activations (batch=1, L=512)  variable         ~1 GB (with checkpointing)
-────────────────────────────────────────────────────
-TOTAL ≈ 5.7 GB   ← fits comfortably on RTX 3090 (24 GB), even 4090!
-
-COMPARISON:
-  Method        │ Min VRAM   │ Quality vs full FT
-  ──────────────┼────────────┼────────────────────
-  Full FT (BF16)│ 160 GB     │ 100% (baseline)
-  LoRA (BF16)   │ 18 GB      │ ~99%
-  QLoRA (NF4)   │ 6-8 GB     │ ~98.5%  (marginal loss)
-  LoRA (INT8)   │ 12 GB      │ ~98%
+     ▲                    each bin has equal area (=equal mass)
+     │      ╱‾‾╲
+     │    ╱      ╲
+     │  ╱          ╲___
+     └──────────────────────► w
+        |   |     |   |      (16 bins → 16 NF4 codes)
 ```
 
 ---
 
-## Exercises
+## 5. Double Quantization
 
-1. Derive the NF4 quantisation levels for the first and last levels (i=0 and i=15). Use the formula qi = E[X | X ∈ [Φ⁻¹(i/16), Φ⁻¹((i+1)/16)]] and the N(0,1) distribution.
-2. Compute the exact memory savings from double quantisation for a 70B parameter model. How much is saved compared to using FP32 quantisation constants?
-3. Estimate the maximum batch size that fits in 24 GB VRAM for QLoRA fine-tuning of LLaMA-3 8B with sequence length 2048. Account for all components in the memory budget table above.
+**First quantisation:** map each **block** (or channel group) of weights to 4-bit indices + **FP16/BF16 scale** \(s\).
+
+**Problem:** millions of small scales \(s\) themselves consume FP16 memory.
+
+**Double quantisation:** quantise the **scales** **again** (e.g., 8-bit) so metadata overhead shrinks:
+
+\[
+s \xrightarrow{Q^{(2)}} \mathrm{code}(s)\quad(\text{with its own scale/offset}).
+\]
+
+**Informal memory effect:** Base weight codes dominate; DQ trims a **noticeable** overhead fraction especially at large widths.
+
+---
+
+## 6. Paged Optimizers and Memory Spikes
+
+AdamW keeps **first and second moments** per trainable parameter (FP32 in many implementations):
+
+\[
+m_t,\; v_t \in \mathbb{R}^{|\Theta|}.
+\]
+
+During long sequences or large microbatch token counts, transient activations may peak VRAM usage. **Paged optimizers** offload optimizer states to **CPU RAM** when GPU memory is **pressure-spiking**, then page chunks back—trading slower steps for survival within budget.
+
+**When it matters:** long context + MoE + adapter training on **consumer GPUs**.
+
+---
+
+## 7. Memory Footprint Formula
+
+A **conceptual** decomposition (train QLoRA, adapters only in Adam FP32):
+
+\[
+M \approx \underbrace{\mathrm{NF4\_weights}}_{\text{base tensors in 4-bit}}
+\;+\;\underbrace{\mathrm{BF16\_adapters}}_{\text{trainable }A,B}
+\;+\;\underbrace{\mathrm{FP32\_optimizer}(\Theta_{\mathrm{LoRA}})}_{\text{Adam }m,v \text{ for adapters}}.
+\]
+
+**Important:** Base weights **gradients** are not materialized in full precision in standard QLoRA training (base frozen), which is why this is far smaller than full fine-tuning.
+
+**Order symbols (per parameter counts):**
+
+- Full finetune train states: often **FP16/BF16 weights + FP32 momenta** for **all** parameters.
+- QLoRA: **4-bit base weights + BF16 adapters + FP32 moments for adapters only**.
+
+---
+
+## 8. Training Recipe (Practical Pseudocode)
+
+```
+load base model into 4-bit (NF4 + double quant of scales)
+inject LoRA modules on chosen projections (q,v,k,o / MLP)
+optimizer = AdamW(θ_LoRA, lr=η, wd=λ)
+
+for minibatch in D:
+    x, y_mask = batch
+    # forward uses dequant matmul kernels for base + adapter addition
+    logits = forward_qlora(model, x)
+    loss = masked_ce(logits, y, y_mask)
+    loss.backward()        # gradients land on adapter params only
+    optimizer.step()
+
+    # optional: gradient checkpointing on activations
+    # optional: paged optimizer handles CPU paging transparently
+```
+
+**Hyperparameter anchors (order-of-magnitude, not universal):**
+
+- Rank \(r\in\{8,16,64,128\}\) depending on target complexity.
+- \(\alpha\) tied to \(r\) (e.g., \(\alpha=16\) or \(\alpha=2r\); follow library defaults consistently).
+- LR often **similar to LoRA on FP16 base**, but validate—quant noise path differs.
+
+---
+
+## 9. Memory Comparison — Full FT vs LoRA vs QLoRA
+
+Let \(N\) be total base parameters. Ignoring embeddings, KV-cache, activations (context-dependent):
+
+| Mode | Dominant weight storage | Dominant trainable states |
+|------|-------------------------|---------------------------|
+| Full FT | BF16/FP16 **all** \(N\) | Adam FP32 **\(\sim 2N\)** often |
+| LoRA (BF16/FP16 base) | BF16 base | BF16 adapters + Adam on adapters |
+| QLoRA | **NF4 base (~0.5 bytes/param class memory)** | BF16 adapters + Adam on adapters |
+
+**Indicative (vary widely by implementation):**
+
+- **7B** params: full FT commonly needs **40–60+ GB** class with optimizer states; QLoRA setups often target **\(<24\) GB** consumer training depending on sequence length and framework overhead.
+- **13B**: full FT typically **\(\sim 2\times\)** needs vs 7B; QLoRA gap widens vs full FT.
+- **70B**: full FT frequently **multi-GPU**; QLoRA enables **single high-end consumer GPU** training of adapters in favorable configurations (still tight on context length).
+
+**Why tables differ across blogs:** KV cache, activation checkpointing, flash-attention, gradient accumulation batching, and whether **output embeddings** are trained all move totals.
+
+---
+
+## 10. Numerical Examples
+
+### Example 1 — Bit accounting (idealized)
+
+Naïve BF16 base storage \(\approx 2\) bytes/param. NF4 \(\approx 0.5\) bytes/param **for codes only**—**4×** compression of raw weights **before** scales; with block scales + DQ, realised savings are **moderately less** than **4×** total DRAM footprint.
+
+### Example 2 — Adapter parameter count
+
+If a layer has \(d_{\mathrm{out}}=4096, d_{\mathrm{in}}=4096\), full \(W\) has \(16{,}777{,}216\) entries. With \(r=16\),
+
+\[
+|A|+|B| = r d_{\mathrm{in}} + r d_{\mathrm{out}} = 16\times 8192 = 131{,}072,
+\]
+
+**\(\sim 128\times\)** fewer trained elements in that layer’s adapter versus dense \(W\) (before counting multiple projections per layer).
+
+### Example 3 — Optimizer memory on adapters only
+
+If total trainable adapters are \(10^7\) parameters, Adam FP32 states \(\approx 2\times 4\times 10^7\) bytes \(\approx 80\) MB **just** for moments (order-of-magnitude). Compare to storing **full** FP32 moments for 7B (**tens of GB**).
+
+### Example 4 — Blockwise affine map (dequantisation)
+
+Partition \(W\) into blocks \(B_j\) of size \(B\) (e.g., 64 or 128 elements per block). For block \(j\), NF4 **indices** \(c_i\in\{0,\ldots,15\}\) and **scale** \(s_j\in\mathbb{R}_{>0}\) reconstruct
+
+\[
+\hat{w}_{j,i} = s_j \cdot \mathrm{NF4\_centroid}(c_{j,i}).
+\]
+
+Thus each block is an **affine pushforward** of a discrete code—gradients through adapters do **not** backprop into discrete \(c\) (frozen \(|\) straight-through estimators absent), but **forward activations** use \(\hat{w}\) as data.
+
+### Example 5 — FLOPs vs memory binding
+
+Suppose a layer matmul costs \(\mathcal{O}(d_{\mathrm{out}} d_{\mathrm{in}})\) MACs. LoRA adds \(\mathcal{O}(r(d_{\mathrm{in}}+d_{\mathrm{out}}))\) extra MACs versus \(\mathcal{O}(r d_{\mathrm{in}} + r d_{\mathrm{out}})\) for two low-rank matmuls—cheap when \(r\ll d\). QLoRA’s dominant question is whether **dequant** bandwidth stalls the GPU; vendor kernels fuse **unpack + matmul**.
+
+---
+
+## Appendix: Lloyd-Max link (qualitative)
+
+For a 1D density \(f(w)\), optimal quantisation levels \(\{q_k\}\) for \(K\) bins with boundaries \(\{b_k\}\) satisfy **centroid condition**:
+
+\[
+q_k = \frac{\int_{b_{k-1}}^{b_k} w\, f(w)\,\mathrm{d}w}{\int_{b_{k-1}}^{b_k} f(w)\,\mathrm{d}w}.
+\]
+
+For **uniform bin masses** on a Gaussian, boundaries are **equispaced quantiles**, centroids are NF4-like. Real NF4 is a **frozen** codebook + **learned per-block** \(s_j\) to handle **non-Gaussian** empirical tails.
+
+---
+
+## 11. Common Mistakes
+
+- ❌ **Assume NF4 alone reduces optimizer memory for full weights.**
+
+  ✓ QLoRA savings assume **adapters-only** training (or selective finetuning). Full-parameter Adam still explodes memory.
+
+- ❌ **Confuse “4-bit storage” with “4-bit compute precision everywhere”.**
+
+  ✓ Many kernels **promote to higher precision** for accumulator math; training stability depends on **BF16 adapters**.
+
+- ❌ **Set rank \(r\) huge “to be safe.”**
+
+  ✓ Larger \(r\) increases adapter compute/memory quadratically in \(r\) across projections—validate on dev.
+
+- ❌ **Ignore double quant overhead accounting** in custom stacks.
+
+  ✓ Measure with profiling; metadata can matter at huge widths.
+
+- ❌ **Expect identical loss curves** as BF16 LoRA.
+
+  ✓ Quant noise + kernel differences → slightly different calibration—may need LR sweep.
+
+---
+
+## 12. Exercises
+
+1. **Rank budget:** For a single linear, express parameter count of LoRA versus full \(W\). Solve for \(r^\*\) where LoRA matches dense count.
+
+2. **MSE intuition:** For a 1D Gaussian, write the Lloyd-Max fixed-point iteration for two levels. Generalize qualitatively to 16 levels.
+
+3. **Scaling law for \(\alpha/r\):** Show how multiplying \(B\) by \(c\) and dividing \(A\) by \(c\) leaves \(BA\) unchanged—why is \(\alpha\) still needed?
+
+4. **Memory formula:** Estimate bytes for NF4 weights \(\approx 0.5N\) + BF16 adapters \(2|{\Theta_{\mathrm{LoRA}}}|\) + FP32 optimizer \(8|{\Theta_{\mathrm{LoRA}}}|\) under 2 moment vectors.
+
+5. **Paged optimizers:** Under what step latency inequality is paging worth it?
+
+---
+
+### Closing remark
+
+QLoRA is a **systems–learning hybrid**: the mathematics is still **conditional likelihood** (or whatever task loss), but **implementation kernels** determine whether the method is stable. Always benchmark **tokens/sec** and **loss** jointly—not bytes alone.

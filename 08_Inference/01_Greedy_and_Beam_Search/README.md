@@ -1,178 +1,301 @@
-# 01 — Greedy Decoding and Beam Search
+# Greedy Decoding and Beam Search
 
-## 1. Greedy Decoding — Formal Definition
+Formal analysis of **left-to-right** autoregressive decoding: **greedy** argmax stacking, **beam search** over partial hypotheses, **length normalization**, complexity, connection to **MAP / approximate inference**, and when greedy is adequate versus harmful.
 
-```
-GREEDY STRATEGY:
-  At each step t, select the single token with highest probability:
+---
 
-  wₜ* = argmax_{k ∈ V} P_θ(k | w₁, ..., wₜ₋₁)
-       = argmax_{k ∈ V} zₖ          ← argmax of logits = argmax of softmax
+## Table of Contents
 
-  NO sampling, NO randomness. Fully deterministic.
+- [1. Variables](#1-variables)
+- [2. Intuition — Local vs Global Optimality](#2-intuition--local-vs-global-optimality)
+- [3. Greedy Decoding](#3-greedy-decoding)
+- [4. Beam Search](#4-beam-search)
+- [5. Length Normalization](#5-length-normalization)
+- [6. Why Greedy Is Suboptimal](#6-why-greedy-is-suboptimal)
+- [7. Complexity Analysis](#7-complexity-analysis)
+- [8. MAP View and Search](#8-map-view-and-search)
+- [9. When Greedy Suffices vs When Beam Helps](#9-when-greedy-suffices-vs-when-beam-helps)
+- [9A. Log-sum structure and why “local argmax” is not global MAP](#9a-log-sum-structure-and-why-local-argmax-is-not-global-map)
+- [10. Pseudocode](#10-pseudocode)
+- [10A. Worked micro-beam (illustrative)](#10a-worked-micro-beam-illustrative)
+- [11. Numerical Examples](#11-numerical-examples)
+- [12. Common Mistakes](#12-common-mistakes)
+- [13. Exercises](#13-exercises)
 
-SEQUENCE SCORE (log-probability):
-  score(w₁...wₙ) = ∑_{t=1}^{n} log P_θ(wₜ | w<t)
+---
 
-Greedy maximises EACH TERM independently, not the sum.
-This is the source of greedy's fundamental limitation.
-```
+## 1. Variables
 
-## 2. Why Greedy Fails — Counterexample
+| Symbol | Meaning |
+|--------|---------|
+| \(V\) | Vocabulary |
+| \(|V|\) | Vocabulary size |
+| \(y_{1:n}\) | Output token sequence of length \(n\) |
+| \(P_\theta(y_t \mid y_{<t}, x)\) | Conditional next-token distribution |
+| \(s(y_{1:t})\) | **Cumulative score** of prefix (often sum of \(\log P\)) |
+| \(B\) | Beam width |
+| \(\alpha\) | Length normalization exponent in beam scoring |
+| \(n\) | Generated length (EOS handling omitted for brevity) |
 
-```
-SMALL VOCABULARY EXAMPLE:
-  V = {A, B, C},  Greedy vs Optimal
+---
 
-  Step 1:
-    P(A|BOS) = 0.55  ← greedy picks A
-    P(B|BOS) = 0.30
-    P(C|BOS) = 0.15
-
-  Step 2 (given A was chosen):
-    P(A|A) = 0.10
-    P(B|A) = 0.20
-    P(C|A) = 0.70  ← greedy picks C (but sequence is now AC)
-
-  Step 2 (if B had been chosen):
-    P(A|B) = 0.05
-    P(B|B) = 0.10
-    P(C|B) = 0.85  ← sequence BC has score log(0.30)+log(0.85)
-
-COMPARISON of complete sequences:
-  Greedy path: AC  → score = log(0.55) + log(0.70) = −0.597 + (−0.357) = −0.954
-  Better path: BC  → score = log(0.30) + log(0.85) = −1.204 + (−0.163) = −1.367  (worse)
-  Another:     AB  → score = log(0.30) + log(0.10) = −1.204 + (−2.303) = −3.507
-
-  Greedy IS optimal here, but consider:
-  
-  Step 1:
-    P(A|BOS) = 0.40  ← greedy picks A
-    P(B|BOS) = 0.35
-    P(C|BOS) = 0.25
-
-  Step 2 given A:  P(C|A)=0.40  → greedy path: AC, score = log(0.40)+log(0.40)=−1.833
-  Step 2 given B:  P(B|B)=0.95  → optimal path: BB, score = log(0.35)+log(0.95)=−1.100 ← BETTER!
-  
-  Greedy missed BB (score 0.65) because step 1 chose A (0.40 > 0.35).
-```
-
-## 3. Beam Search — Complete Algorithm
+## 2. Intuition — Local vs Global Optimality
 
 ```
-ALGORITHM (beam width B):
+GREEDY (myopic):
+  step t: pick w_t = argmax P(w | prefix)
+          ▲
+          └── maximises EACH step — NOT necessarily the PRODUCT along the path
 
-  INITIALISE:
-    beams = [(score=0, sequence=[BOS])]   ← single initial beam
-
-  FOR t = 1, 2, 3, ...:
-    candidates = []
-    
-    FOR each (score_h, sequence_h) in beams:
-      FOR each token k in V:
-        new_score = score_h + log P_θ(k | sequence_h)
-        new_seq   = sequence_h + [k]
-        candidates.append((new_score, new_seq))
-    
-    candidates.sort(key=lambda x: x.score, DESCENDING)
-    
-    beams_new = []
-    FOR each (score, seq) in candidates[:∞]:   ← consider all
-      IF seq ends with EOS:
-        completed.append((score, seq))         ← move to completed
-      ELSE:
-        beams_new.append((score, seq))
-      IF len(beams_new) == B: BREAK             ← keep only top B
-    
-    beams = beams_new
-
-  RETURN best sequence in completed (or if none, best in beams)
-
-COMPLEXITY:
-  Per step: B × |V| candidate scores computed
-  Steps until EOS (average length L)
-  Total: B × |V| × L   model forward passes... but wait!
-  
-  With KV cache: each beam is an independent sequence.
-  KV cache is maintained separately for each beam.
-  → B model forward passes per step (not B×|V|!)
-  → |V| is handled by the logits vector, not separate forward passes
-```
-
-## 4. Length Penalty — Why and How
-
-```
-PROBLEM: Beam search score = ∑ log P(wₜ) is a SUM.
-  Each term is negative: log P(wₜ) ≤ 0.
-  Longer sequences accumulate more negative terms → lower score!
-  
-  ┌──────────────────────────────────────────────────────────┐
-  │  "yes" (1 token):     score = log(0.3) = −1.2            │
-  │  "yes it is" (3 tok): score = log(0.3)+log(0.8)+log(0.9) │
-  │                             = −1.2 − 0.22 − 0.10 = −1.52 │
-  │                                                           │
-  │  Beam search prefers "yes" over "yes it is"               │
-  │  even though the full answer is more informative!         │
-  └──────────────────────────────────────────────────────────┘
-
-LENGTH NORMALISATION:
-  score_normalised(w₁...wₙ) = (1/n^α) × ∑_t log P(wₜ | w<t)
-  
-  α = 0: no normalisation (raw log-prob, biased toward short)
-  α = 1: divide by length (penalise short AND long equally)
-  α ∈ (0,1): partial normalisation (typical: α=0.6 in Google NMT)
-
-CHOOSING α:
-  Consider two sequences of length 3 and 5:
-    Short: sum log P = −3.0,  normalised = −3.0/3^{0.6} = −3.0/1.93 = −1.55
-    Long:  sum log P = −4.5,  normalised = −4.5/5^{0.6} = −4.5/2.63 = −1.71
-
-  At α=0.6:  short wins   (−1.55 > −1.71)
-  If long had sum=−4.0:   −4.0/2.63 = −1.52  long wins  ← depends on content quality
-
-  EMPIRICALLY: α=0.6–0.8 works well for translation/summarisation.
-```
-
-## 5. When to Use Each Decoding Strategy
-
-```
-TASK COMPARISON:
-
-Task                    │ Recommended │ Why
-────────────────────────┼─────────────┼──────────────────────────────────────────
-Machine translation     │ Beam B=4    │ Single correct answer, quality matters
-Code generation         │ Beam B=4    │ Syntax must be correct, deterministic preferred
-Mathematical reasoning  │ Greedy      │ Temperature=0 or beam B=1 (single correct answer)
-Story writing           │ Sampling    │ Diversity needed, multiple good answers exist
-Chatbot response        │ T+top-p     │ Natural, varied, contextually appropriate
-Summarisation           │ Beam B=4    │ Content coverage matters, some creativity OK
-Scientific QA           │ Greedy/T=0  │ Factual accuracy, reproducible
-
-MATHEMATICAL COMPARISON:
-
-  GREEDY = Beam B=1:
-    Maximize per-step log prob.
-    Optimal at each step but NOT globally optimal.
-    O(1) overhead per token beyond base inference.
-
-  BEAM B:
-    Maintains B partial sequences simultaneously.
-    Provably better global solution than greedy (within B candidates).
-    Memory: B × (KV cache per sequence)
-    
-    For LLaMA-3 8B, B=4, L=500 tokens:
-    Extra memory vs greedy: 3 × (500 × 128 KB) ≈ 192 MB  (manageable)
-
-  SAMPLING (next section):
-    Does NOT maximise probability.
-    Samples from P_θ(·|context) with modifications.
-    Non-deterministic: different output each run.
+BEAM (keeps contenders):
+  maintain B best PARTIAL sequences at each step
+          ▼
+  may recover a path that looked worse at t=1 but wins overall
 ```
 
 ---
 
-## Exercises
+## 3. Greedy Decoding
 
-1. Show that beam search with B=1 is identical to greedy decoding (prove they produce the same output).
-2. For a vocabulary of |V|=50K and sequence length L=100, how many total sequences does beam search (B=5) maintain at each step? Why is this tractable compared to full search?
-3. Prove that the length-normalised score (1/n^α) × ∑ log P is equivalent to geometric mean of per-step probabilities raised to the power 1/α. What does this mean intuitively?
+At each time \(t\),
+
+\[
+w_t^\star = \arg\max_{w\in V} P_\theta(w \mid x,\, y_{<t})
+= \arg\max_{w\in V} z_{t,w},
+\]
+
+where \(z_{t,w}\) are **logits** (monotone with softmax probabilities).
+
+**Log-score of full string:**
+
+\[
+\log P_\theta(y_{1:n}\mid x)
+= \sum_{t=1}^{n} \log P_\theta(y_t \mid x, y_{<t}).
+\]
+
+Greedy **maximizes each summand location-wise** assuming earlier tokens fixed—but that differs from maximizing the **sum** over **jointly chosen** \(y_{1:n}\).
+
+---
+
+## 4. Beam Search
+
+Maintains \(B\) **partial hypotheses**. At each step, **expand** each hypothesis with **all** or **top-k** token extensions, **score**, then **prune** to top \(B\) partial sequences by cumulative metric.
+
+**Unnormalized log-score:**
+
+\[
+S(y_{1:t}) = \sum_{i=1}^{t} \log P_\theta(y_i \mid x, y_{<i}).
+\]
+
+---
+
+## 5. Length Normalization
+
+Compare hypotheses of **different lengths** with:
+
+\[
+S_{\alpha}(y_{1:n}) = \frac{1}{n^{\alpha}} \sum_{t=1}^{n} \log P_\theta(y_t \mid x, y_{<t}).
+\]
+
+- \(\alpha=0\): no normalization (longer strings tend to have more **negative** raw log-probs).
+- \(\alpha=1\): **per-token average logprob** (very common heuristic).
+- \(\alpha \in (0,1)\): **compromise** penalizing brevity less than \(\alpha=1\).
+
+**Rationale:** Product of conditional probabilities **shrinks** with length unless probabilities are nearly 1; normalization avoids pathological preference for **very short** outputs in beam ranking.
+
+---
+
+## 6. Why Greedy Is Suboptimal
+
+Even with exact \(P_\theta\), **the joint MAP sequence** \(\arg\max_{y_{1:n}} P(y_{1:n}\mid x)\) **does not** reduce to per-step argmax unless the model satisfies strong **conditional independence** structures (which autoregressive LMs **do not**).
+
+**Toy counterexample sketch:**
+
+At \(t=1\), token \(a\) has highest **local** conditional prob, but all good **long** continuations after \(a\) are poor; a slightly lower first token \(b\) may open a branch where later tokens achieve **much higher** conditional probs such that the **total sum of logs** beats the greedy path.
+
+---
+
+## 7. Complexity Analysis
+
+Let maximum length \(n\).
+
+**Greedy:**
+
+- Per step: \(\mathcal{O}(|V|)\) logits or \(\mathcal{O}(|V|)\) with top-k partial tricks in softmax.
+- **Total:** \(\mathcal{O}(n\,|V|)\) time in naive form; in practice dominated by transformer forward at each step \(\mathcal{O}(n^2 d)\) with KV-cache in attention.
+
+**Beam with full expansion:**
+
+- Roughly **\(\mathcal{O}(B\cdot |V|\cdot n)\)** candidate scoring operations for naive **full-vocabulary** expansions each step before pruning—often too large—so implementations use **hard top-k** candidates per beam hypothesis.
+
+**Memory:** \(\mathcal{O}(B\cdot n)\) to store tokens and scores.
+
+**Statement requested by syllabus (aggregate form):** Beam search complexity is often summarized as **\(\mathcal{O}(B\times|V|\times n)\)** in **naive** full expansions; **optimized** stacks reduce effective \(|V|\) via pruning, GPU sampling kernels, or n-approx.
+
+---
+
+## 8. MAP View and Search
+
+**Exact MAP:**
+
+\[
+y^\star = \arg\max_{y\in V^*} \; P_\theta(y\mid x)
+= \arg\max_{y} \sum_{t} \log P_\theta(y_t\mid x,y_{<t}).
+\]
+
+**Search interpretation:**
+
+- Greedy = **very shallow** search (width 1, myopic).
+- Beam = **bounded-width** approximate combinatorial optimisation.
+- For **log-linear** models with Markov structure, dynamic programming helps; for **general** autoregressive transformers, **no exact poly-time** MAP trick exists—beam is heuristic.
+
+---
+
+## 9. When Greedy Suffices vs When Beam Helps
+
+| Scenario | Greedy often | Beam helps |
+|----------|--------------|------------|
+| Nearly **unimodal** next-token distributions | Good enough | Marginal |
+| **Strong** local winner at each step correlates with global MAP | Good | Marginal |
+| **Structured outputs** (code, math) with brittle early mistakes | May fail | Often improves |
+| **Copying** long spans from input (pointer-like) | Can work with **constrained** decoding | Beam + constraints common |
+| Open-ended creative generation | Quality may not correlate with prob | Sampling often preferred over beam |
+
+**NMT history note:** RNN-era translation benefited from beam; with **instruction-tuned** chat models, many production stacks use **sampling** rather than beam for naturalness.
+
+---
+
+## 9A. Log-sum structure and why “local argmax” is not global MAP
+
+Autoregressive factorization:
+
+\[
+\log P(y_{1:n}\mid x)
+= \sum_{t=1}^{n} f_t(y_t),\quad f_t(y_t)=\log P(y_t\mid x,y_{<t}).
+\]
+
+Greedy chooses \(\hat{y}_t=\arg\max_{v} f_t(v)\) **sequentially**. A **global** MAP chooses \(\mathbf{y}^\star\in\arg\max_{\mathbf{y}\in V^n} \sum_t f_t(y_t)\).
+
+**Observation:** This is a **discrete combinatorial** optimisation; only if choices **factorize independently** does sequential maximisation coincide—here \(f_t\) depends on the **whole** prefix \(y_{<t}\), yielding **path dependence**.
+
+**Small theorem (prefix dominance is insufficient):** There exist SCMs where every strict prefix of \(\mathbf{y}^\star\) is **not** one-step greedy because an alternate first token lowers \(f_1\) but **raises** a long-run sum \(\sum f_t\). Beam search keeps such alternatives **alive** up to width \(B\).
+
+**Connection to dynamic programming:** If each \(f_t\) depended only on a **finite state** of bounded memory (e.g., Markov order \(m\)), Viterbi-like DP would apply—Transformers have **unbounded** context dependence, so **exact** MAP is expensive.
+
+---
+
+## 10. Pseudocode
+
+```
+function greedy_generate(model, x, max_len):
+    y ← empty list
+    for t in 1..max_len:
+        logits ← model(x, y)
+        w ← argmax softmax(logits)
+        append w to y
+        if w == EOS: break
+    return y
+
+function beam_search(model, x, B, α, max_len):
+    beams ← [(score=0, y=[])]
+    for t in 1..max_len:
+        candidates ← []
+        for (S, y) in beams:
+            logits ← model(x, y)
+            # optionally restrict to top-K extensions per beam
+            for w in vocabulary_or_topK(logits):
+                Δ ← log P(w | x, y)  # from log_softmax
+                S_new ← S + Δ
+                candidates.append( (S_new, y + [w]) )
+        prune candidates by S_new / (len(y)+1)^α   # length-normalised score
+        keep top B hypotheses
+        beams ← pruned
+        if all EOS: break
+    return argmax_final(beams by S / len^α)
+```
+
+---
+
+## 10A. Worked micro-beam (illustrative)
+
+Let \(B=2\), two-step generation, vocabulary \(\{A,B\}\). Suppose prefix is BOS.
+
+| Step | Hypothesis | Last token | Stored \(\sum \log P\) (unnormalised) |
+|------|------------|------------|---------------------------------------|
+| 1 | h1 | A | \(\log 0.6\) |
+| 1 | h2 | B | \(\log 0.4\) |
+| 2 from h1 | AA | \(\log 0.6 + \log 0.2\) | \(\log 0.12\) |
+| 2 from h1 | AB | \(\log 0.6 + \log 0.8\) | \(\log 0.48\) |
+| 2 from h2 | BA | \(\log 0.4 + \log 0.85\) | **higher** if \(\log 0.34 > \log 0.12\) etc. |
+
+Beam **keeps two best** rows at step 2; greedy might have locked into \(A\) at step 1 even if **BA** beats **AA** after two steps.
+
+**Takeaway:** beam maintains **disjunction** of second-best prefixes; greedy commits **irreversibly** at \(t=1\).
+
+---
+
+## 11. Numerical Examples
+
+### Example 1 — Two-step toy
+
+Suppose after \(x\),
+
+- Branch A: \(\log P(a|x)=-0.22\) (prob \(\approx 0.8\)), but next step best is poor: \(\log P(c|xa)=-1.61\). Total \(\log p \approx -1.83\).
+
+- Branch B: \(\log P(b|x)=-1.00\) (prob \(\approx 0.37\)), but \(\log P(c|xb)=-0.10\). Total \(\approx -1.10\).
+
+Greedy picks **a** first (higher local prob), yet **bc** beats **ac** globally under product of conditionals.
+
+### Example 2 — Length normalization
+
+Two completed strings:
+
+- \(y^{(1)}\) length 4: total \(\log p=-8.0\). Average \(\frac{-8}{4}=-2.0\).
+
+- \(y^{(2)}\) length 8: total \(\log p=-14.0\). Average \(\frac{-14}{8}=-1.75\).
+
+**Raw sum** prefers \(y^{(1)}\) (\(-8 > -14\)), but **per-token average** prefers \(y^{(2)}\). Choosing \(\alpha\) tunes brevity bias.
+
+---
+
+## 12. Common Mistakes
+
+- ❌ **Think argmax per step maximizes sequence joint probability.**
+
+  ✓ It only maximizes a **nested greedy** approximation; beam or exact search may differ.
+
+- ❌ **Compare beams of different lengths without normalization.**
+
+  ✓ Apply \(\alpha\)-normalization or EOS-aware scoring.
+
+- ❌ **Set beam \(B\) enormous for chat quality.**
+
+  ✓ Large \(B\) can favor **generic high-probability** text; not always “better” subjectively.
+
+- ❌ **Ignore logits numerics (float32 vs bfloat16).**
+
+  ✓ Argmax stable; beams comparing **tiny** score differences can be noisy.
+
+- ❌ **Assume beam complexity ignores top-k pruning.**
+
+  ✓ Practical runtimes often **much better** than naive \(B|V|\) expansions.
+
+---
+
+## 13. Exercises
+
+1. Construct a **3-level** binary tree where greedy path has **higher** product at depth 1 but **lower** product at full depth.
+
+2. Prove \(\arg\max_y \prod_t p_t(y_t)\) with factors \(p_t(y_t)=P(y_t\mid\cdot)\) **is not** solved by per-step argmax—give explicit \(2\times 2\) table counterexample.
+
+3. Show how \(\alpha\) affects preference for length \(n\) when per-token logprobs are i.i.d. negative constants (pathological sanity check).
+
+4. Relate beam search to **Viterbi** on **HMM**—what structural difference breaks exact DP for Transformers?
+
+5. Estimate time per token given \(T_\mathrm{fwd}\) for one forward pass—how does doubling \(B\) change steps if using **parallel** batch expansions?
+
+---
+
+### Footnote
+
+Decoding is **inference-time** algorithmics on a **fixed** model; changing decoding **does not** change likelihoods— it changes which mode of \(P_\theta\) you **surface**.
