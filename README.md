@@ -307,4 +307,3 @@ A: It does grow linearly. For n tokens, KV cache = O(n × L × d).
 ---
 
 
-```
